@@ -21,9 +21,11 @@ jobs:
 
           # timeout command is part of coreutils, already present on ubuntu-latest
 
-          sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg git coreutils
+          # Install jq for JSON processing in results summary
 
-          echo "Installed base packages."
+          sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg git coreutils jq
+
+          echo "Installed base packages (including jq)."
 
 
           # Node.js v20 (needed for mcp-inspector and some servers)
@@ -98,11 +100,31 @@ jobs:
           command -v timeout
 
 
+          # Verify tr command exists (should be part of coreutils)
+
+          echo "Verifying tr command..."
+
+          command -v tr
+
+
+          # Verify jq command exists
+
+          echo "Verifying jq command..."
+
+          command -v jq
+
+
           # Persist PATH changes for subsequent steps via GITHUB_ENV
 
           echo "Exporting PATH for subsequent steps..."
 
-          echo "PATH=$HOME/.cargo/bin:$HOME/.deno/bin:/usr/local/go/bin:$PATH" >> $GITHUB_ENV
+          # Construct the final PATH order carefully
+
+          FINAL_PATH="$HOME/.cargo/bin:$HOME/.deno/bin:/usr/local/go/bin:${PATH}"
+
+          echo "Final PATH to be exported: $FINAL_PATH"
+
+          echo "PATH=$FINAL_PATH" >> $GITHUB_ENV
       - name: Fetch and Parse Server List
         id: fetch
         shell: bash -eo pipefail {0}
@@ -123,6 +145,7 @@ jobs:
           awk '/^## Server Implementations/{flag=1; next} /^## Frameworks/{flag=0} flag' README.md | \
             grep -oE 'https?:\/\/(github\.com|gitlab\.com|gitea\.com)\/[^/]+\/[^)/ ]+' | \
             sed -E 's/^https?:\/\///' | \
+            sed 's/\.git$//' | # Remove trailing .git if present
             sort -u > ../repo_list.txt
 
           REPO_COUNT=$(cat ../repo_list.txt | wc -l)
@@ -179,6 +202,9 @@ jobs:
           declare -a RESULTS # Array to hold detailed results
 
 
+          echo "Starting server tests. Using PATH: $PATH" # Verify PATH is correct
+
+
           # Read the list line by line safely
 
           while IFS= read -r REPO || [ -n "$REPO" ]; do
@@ -191,14 +217,17 @@ jobs:
             CURRENT_INDEX=$((CURRENT_INDEX + 1))
             echo ""
             echo "======================================================================"
-            echo "Starting Test [$CURRENT_INDEX/$REPO_COUNT]: ${REPO}"
+            # Use tr to create a safer name (should work now)
+            # First check if tr exists, fail early if not (though setup should guarantee it)
+            command -v tr >/dev/null 2>&1 || { echo "::error:: 'tr' command not found in PATH ($PATH)!"; exit 1; }
+            REPO_SLUG=$(echo "$REPO" | tr '/' '_' | tr '.' '_')
+            echo "Starting Test [$CURRENT_INDEX/$REPO_COUNT]: ${REPO} (Slug: ${REPO_SLUG})"
             echo "======================================================================"
             echo ""
 
             # --- Variables for this iteration ---
             # Use GITHUB_WORKSPACE as base for unique dir per iteration
             CHECKOUT_DIR="${GITHUB_WORKSPACE}/mcp_server_under_test_${CURRENT_INDEX}"
-            REPO_SLUG=$(echo "$REPO" | tr '/' '_' | tr '.' '_') # Create a safer name for docker etc.
             STATUS="SKIPPED" # Default status
             REASON="Test logic did not complete or match a known type." # Default reason
             RUN_METHOD="None"
@@ -210,18 +239,20 @@ jobs:
             rm -rf "$CHECKOUT_PATH" # Clean previous checkout just in case
             # Add timeout for git clone, handle different git providers
             GIT_CLONE_URL=""
-            if [[ "$REPO" == github.com/* ]]; then
-              GIT_CLONE_URL="https://${REPO}.git"
-            elif [[ "$REPO" == gitlab.com/* ]]; then
-              GIT_CLONE_URL="https://${REPO}.git"
-            elif [[ "$REPO" == gitea.com/* ]]; then # Assuming gitea.com is the host, adjust if self-hosted
+            # Handle owner/repo format directly, assuming GitHub if no domain
+            if [[ "$REPO" == */* && ! "$REPO" == *.*/* ]]; then
+                GIT_CLONE_URL="https://github.com/${REPO}.git"
+            # Handle full URLs starting with known domains
+            elif [[ "$REPO" == github.com/* || "$REPO" == gitlab.com/* || "$REPO" == gitea.com/* ]]; then
               GIT_CLONE_URL="https://${REPO}.git"
             else
-              # Assume GitHub if no domain prefix or unrecognized
-              GIT_CLONE_URL="https://github.com/${REPO}.git"
+              # Fallback assumption or handle error
+              echo "::warning:: Unrecognized repo format: ${REPO}. Assuming GitHub."
+              GIT_CLONE_URL="https://github.com/${REPO}.git" # May fail if not GitHub
             fi
 
             echo "--> Cloning URL: $GIT_CLONE_URL"
+            # Use timeout with 's' suffix for clarity
             timeout 300s git clone --depth 1 "$GIT_CLONE_URL" "$CHECKOUT_PATH"
             CHECKOUT_SUCCESS=$?
 
@@ -256,31 +287,38 @@ jobs:
 
                  # Define a function to write results before exiting subshell
                  write_result() {
+                   # Make sure the result file directory exists (it should, it's GITHUB_WORKSPACE)
+                   mkdir -p "$(dirname "$SUBSHELL_RESULT_FILE")"
                    echo "SUB_STATUS=$1" > "$SUBSHELL_RESULT_FILE"
                    echo "SUB_REASON=$2" >> "$SUBSHELL_RESULT_FILE"
                    echo "SUB_RUN_METHOD=$3" >> "$SUBSHELL_RESULT_FILE"
                  }
                  # Ensure result file is written even on script exit (including errors due to set -e)
+                 # Use EXIT trap carefully with set -e; it might fire before the failing command fully exits
                  trap 'write_result "$SUB_STATUS" "$SUB_REASON" "$SUB_RUN_METHOD"' EXIT
 
                  # --- Detection Logic ---
-                 echo "--- Detecting Run Method ---"
+                 echo "--- Detecting Run Method (in $PWD) ---"
 
                  # Priority 1: Known Specific Servers
                  # Use normalized REPO variable here
-                 if [[ "$REPO" == "github/github-mcp-server" ]]; then
+                 # Extract owner/repo part for comparison if full URL was given
+                 NORMALIZED_REPO_NAME=$(echo "$REPO" | sed -E 's/^(github\.com|gitlab\.com|gitea\.com)\///' | sed 's/\.git$//')
+                 echo "Normalized Repo Name for matching: $NORMALIZED_REPO_NAME"
+
+                 if [[ "$NORMALIZED_REPO_NAME" == "github/github-mcp-server" ]]; then
                    SUB_RUN_METHOD="Docker Image (Official GitHub)"
                    echo "--> Matched specific: github/github-mcp-server"
                    if [ -z "$GH_MCP_TOKEN" ]; then
-                     echo "::warning::Required secret MCP_TESTER_GITHUB_PAT not set."; SUB_STATUS="SKIPPED"; SUB_REASON="Required secret MCP_TESTER_GITHUB_PAT not set"; exit 0;
+                     echo "::warning::Required secret MCP_TESTER_GITHUB_PAT not set."; SUB_STATUS="SKIPPED"; SUB_REASON="Required secret MCP_TESTER_GITHUB_PAT not set"; trap - EXIT; write_result "$SUB_STATUS" "$SUB_REASON" "$SUB_RUN_METHOD"; exit 0;
                    fi
                    SERVER_CMD="docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN=$GH_MCP_TOKEN ghcr.io/github/github-mcp-server"
-                   echo "--> Testing command: npx inspector --cli \"$SERVER_CMD\" --method tools/list"
+                   echo "--> Testing command: npx inspector --cli \"<docker cmd>\" --method tools/list"
                    timeout 180s npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list
                    INSPECTOR_EXIT_CODE=$?
                    if [ $INSPECTOR_EXIT_CODE -eq 0 ]; then SUB_STATUS="SUCCESS"; SUB_REASON="Tested via Docker Image (stdio)"; else SUB_STATUS="FAILURE"; SUB_REASON="Inspector failed (Exit code $INSPECTOR_EXIT_CODE) for Docker Image"; fi
 
-                 elif [[ "$REPO" == "microsoft/playwright-mcp" ]]; then
+                 elif [[ "$NORMALIZED_REPO_NAME" == "microsoft/playwright-mcp" ]]; then
                    SUB_RUN_METHOD="npx @playwright/mcp"
                    echo "--> Matched specific: microsoft/playwright-mcp"
                    SERVER_CMD="npx --yes @playwright/mcp@latest --headless"
@@ -289,13 +327,17 @@ jobs:
                    INSPECTOR_EXIT_CODE=$?
                    if [ $INSPECTOR_EXIT_CODE -eq 0 ]; then SUB_STATUS="SUCCESS"; SUB_REASON="Tested via npx (stdio)"; else SUB_STATUS="FAILURE"; SUB_REASON="Inspector failed (Exit code $INSPECTOR_EXIT_CODE) for npx command"; fi
 
-                 elif [[ "$REPO" == "pydantic/pydantic-ai" ]]; then # Assuming mcp-run-python is within this repo structure
+                 elif [[ "$NORMALIZED_REPO_NAME" == "pydantic/pydantic-ai" ]]; then # Assuming mcp-run-python is within this repo structure
                    SUB_RUN_METHOD="deno run jsr:"
                    echo "--> Matched specific: pydantic/mcp-run-python (from pydantic-ai repo)"
                    # Deno needs to run where node_modules cache will be created, usually outside the checkout
                    # Let's run it from GITHUB_WORKSPACE to be safe
                    echo "--> Running Deno warmup from ${GITHUB_WORKSPACE}..."
                    ( cd "${GITHUB_WORKSPACE}" && deno run -A --node-modules-dir=auto jsr:@pydantic/mcp-run-python warmup )
+                   WARMUP_EXIT_CODE=$?
+                   if [ $WARMUP_EXIT_CODE -ne 0 ]; then
+                       echo "::error::Deno warmup failed (Exit code $WARMUP_EXIT_CODE)"; SUB_STATUS="FAILURE"; SUB_REASON="Deno warmup failed"; trap - EXIT; write_result "$SUB_STATUS" "$SUB_REASON" "$SUB_RUN_METHOD"; exit 1;
+                   fi
                    echo "--> Testing command: npx inspector --cli \"deno run ... stdio\" --method tools/list"
                    # Run the server itself from the workspace context too, using the JSR package directly
                    SERVER_CMD="deno run -A --node-modules-dir=auto jsr:@pydantic/mcp-run-python stdio"
@@ -316,27 +358,30 @@ jobs:
                      timeout 300s docker build -t "$IMAGE_TAG" .
                      BUILD_EXIT_CODE=$?
                      if [ $BUILD_EXIT_CODE -ne 0 ]; then
-                       echo "::warning::docker build failed (Exit code $BUILD_EXIT_CODE)."; SUB_STATUS="SKIPPED"; SUB_REASON="docker build failed"; exit 0;
+                       echo "::warning::docker build failed (Exit code $BUILD_EXIT_CODE)."; SUB_STATUS="SKIPPED"; SUB_REASON="docker build failed"; trap - EXIT; write_result "$SUB_STATUS" "$SUB_REASON" "$SUB_RUN_METHOD"; exit 0;
                      fi
                      HOST_PORT=6277 # Use a fixed host port sequentially
                      INTERNAL_PORT=8080 # Try common internal port first
                      echo "--> Starting container $CONTAINER_NAME ($IMAGE_TAG) mapping ${HOST_PORT}:${INTERNAL_PORT}..."
+                     # Attempt to run, capture potential immediate errors
                      docker run -d --rm --name "$CONTAINER_NAME" -p "${HOST_PORT}:${INTERNAL_PORT}" "$IMAGE_TAG"
                      RUN_EXIT_CODE=$?
-                     # If run fails or container exits quickly, try port 6277
-                     if [ $RUN_EXIT_CODE -ne 0 ] || ! docker ps --filter "name=$CONTAINER_NAME" --filter "status=running" | grep -q "$CONTAINER_NAME"; then
-                       echo "--> Initial run failed or container exited. Trying internal port 6277..."
+                     sleep 5 # Brief pause to let container potentially fail early
+                     # Check if running
+                     if ! docker ps --filter "name=$CONTAINER_NAME" --filter "status=running" | grep -q "$CONTAINER_NAME"; then
+                       echo "--> Initial run failed or container exited quickly (Exit code $RUN_EXIT_CODE). Trying internal port 6277..."
                        INTERNAL_PORT=6277
-                       # Ensure previous attempt is cleaned up if it partially started
+                       # Ensure previous attempt is cleaned up
                        set +e; docker stop "$CONTAINER_NAME" > /dev/null 2>&1; docker rm "$CONTAINER_NAME" > /dev/null 2>&1; set -e
                        docker run -d --rm --name "$CONTAINER_NAME" -p "${HOST_PORT}:${INTERNAL_PORT}" "$IMAGE_TAG"
                        RUN_EXIT_CODE=$?
+                       sleep 5
                      fi
                      # If still not running, fail the test
-                     if [ $RUN_EXIT_CODE -ne 0 ] || ! docker ps --filter "name=$CONTAINER_NAME" --filter "status=running" | grep -q "$CONTAINER_NAME"; then
-                        echo "::error::Failed to start container '$CONTAINER_NAME' via Dockerfile on ports 8080 or 6277."; SUB_STATUS="FAILURE"; SUB_REASON="docker run failed"; exit 1; # Fail subshell
+                     if ! docker ps --filter "name=$CONTAINER_NAME" --filter "status=running" | grep -q "$CONTAINER_NAME"; then
+                        echo "::error::Failed to start container '$CONTAINER_NAME' via Dockerfile on ports 8080 or 6277 (Exit code $RUN_EXIT_CODE)."; SUB_STATUS="FAILURE"; SUB_REASON="docker run failed or container exited"; trap - EXIT; write_result "$SUB_STATUS" "$SUB_REASON" "$SUB_RUN_METHOD"; exit 1;
                      fi
-                     echo "--> Container started. Waiting 20s for server..."
+                     echo "--> Container started. Waiting 20s for server initialization..."
                      sleep 20
                      TEST_URL="http://localhost:${HOST_PORT}/sse"
                      echo "--> Testing SSE endpoint: $TEST_URL"
@@ -359,26 +404,30 @@ jobs:
                      timeout 300s docker build -t "$IMAGE_TAG" .
                      BUILD_EXIT_CODE=$?
                      if [ $BUILD_EXIT_CODE -ne 0 ]; then
-                       echo "::warning::docker build failed (Exit code $BUILD_EXIT_CODE)."; SUB_STATUS="SKIPPED"; SUB_REASON="docker build failed"; exit 0;
+                       echo "::warning::docker build failed (Exit code $BUILD_EXIT_CODE)."; SUB_STATUS="SKIPPED"; SUB_REASON="docker build failed"; trap - EXIT; write_result "$SUB_STATUS" "$SUB_REASON" "$SUB_RUN_METHOD"; exit 0;
                      fi
                      HOST_PORT=6277 # Use a fixed host port sequentially
                      INTERNAL_PORT=8080 # Try common internal port first
                      echo "--> Starting container $CONTAINER_NAME ($IMAGE_TAG) mapping ${HOST_PORT}:${INTERNAL_PORT}..."
+                     # Attempt to run, capture potential immediate errors
                      docker run -d --rm --name "$CONTAINER_NAME" -p "${HOST_PORT}:${INTERNAL_PORT}" "$IMAGE_TAG"
                      RUN_EXIT_CODE=$?
-                     # If run fails or container exits quickly, try port 6277
-                     if [ $RUN_EXIT_CODE -ne 0 ] || ! docker ps --filter "name=$CONTAINER_NAME" --filter "status=running" | grep -q "$CONTAINER_NAME"; then
-                       echo "--> Initial run failed or container exited. Trying internal port 6277..."
+                     sleep 5 # Brief pause to let container potentially fail early
+                     # Check if running
+                     if ! docker ps --filter "name=$CONTAINER_NAME" --filter "status=running" | grep -q "$CONTAINER_NAME"; then
+                       echo "--> Initial run failed or container exited quickly (Exit code $RUN_EXIT_CODE). Trying internal port 6277..."
                        INTERNAL_PORT=6277
+                       # Ensure previous attempt is cleaned up
                        set +e; docker stop "$CONTAINER_NAME" > /dev/null 2>&1; docker rm "$CONTAINER_NAME" > /dev/null 2>&1; set -e
                        docker run -d --rm --name "$CONTAINER_NAME" -p "${HOST_PORT}:${INTERNAL_PORT}" "$IMAGE_TAG"
                        RUN_EXIT_CODE=$?
+                       sleep 5
                      fi
                      # If still not running, fail the test
-                     if [ $RUN_EXIT_CODE -ne 0 ] || ! docker ps --filter "name=$CONTAINER_NAME" --filter "status=running" | grep -q "$CONTAINER_NAME"; then
-                       echo "::error::Failed to start container '$CONTAINER_NAME' via Dockerfile on ports 8080 or 6277."; SUB_STATUS="FAILURE"; SUB_REASON="docker run failed"; exit 1; # Fail subshell
+                     if ! docker ps --filter "name=$CONTAINER_NAME" --filter "status=running" | grep -q "$CONTAINER_NAME"; then
+                        echo "::error::Failed to start container '$CONTAINER_NAME' via Dockerfile on ports 8080 or 6277 (Exit code $RUN_EXIT_CODE)."; SUB_STATUS="FAILURE"; SUB_REASON="docker run failed or container exited"; trap - EXIT; write_result "$SUB_STATUS" "$SUB_REASON" "$SUB_RUN_METHOD"; exit 1;
                      fi
-                     echo "--> Container started. Waiting 20s for server..."
+                     echo "--> Container started. Waiting 20s for server initialization..."
                      sleep 20
                      TEST_URL="http://localhost:${HOST_PORT}/sse"
                      echo "--> Testing SSE endpoint: $TEST_URL"
@@ -391,43 +440,55 @@ jobs:
                  # Priority 4: package.json (Node.js)
                  elif [ -f "package.json" ]; then
                    SUB_RUN_METHOD="Node.js (package.json)"
-                   echo "--> Found package.json. Running npm install..."
+                   echo "--> Found package.json. Running npm install/ci..."
                    # Use ci for potentially faster/more reliable installs if lock file exists
                    if [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ]; then
+                     echo "--> Using npm ci"
                      timeout 300s npm ci --no-audit --no-fund --loglevel=error
                    else
+                     echo "--> Using npm install"
                      timeout 300s npm install --no-audit --no-fund --loglevel=error
                    fi
                    INSTALL_EXIT_CODE=$?
                    if [ $INSTALL_EXIT_CODE -ne 0 ]; then
-                     echo "::warning::npm install/ci failed (Exit code $INSTALL_EXIT_CODE)."; SUB_STATUS="SKIPPED"; SUB_REASON="npm install/ci failed"; exit 0;
+                     echo "::warning::npm install/ci failed (Exit code $INSTALL_EXIT_CODE)."; SUB_STATUS="SKIPPED"; SUB_REASON="npm install/ci failed"; trap - EXIT; write_result "$SUB_STATUS" "$SUB_REASON" "$SUB_RUN_METHOD"; exit 0;
                    fi
                    # Try standard start commands
                    SERVER_CMD=""
                    INSPECTOR_EXIT_CODE=1 # Default to failure unless a command succeeds
+                   NPM_START_DEFINED=$(node -e "process.exit(require('./package.json').scripts?.start ? 0 : 1)")
                    # Check scripts first
-                   if node -e "process.exit(require('./package.json').scripts?.start ? 0 : 1)"; then
+                   if [ "$NPM_START_DEFINED" == "0" ]; then
                      echo "--> Found 'start' script in package.json. Trying 'npm start'..."
                      SERVER_CMD="npm start"
                      timeout 180s npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list
                      INSPECTOR_EXIT_CODE=$?
+                   else
+                      echo "--> No 'start' script found in package.json."
                    fi
                    # If npm start failed or doesn't exist, try node .
                    if [ $INSPECTOR_EXIT_CODE -ne 0 ]; then
                      echo "--> Trying 'node .'..."
                      SERVER_CMD="node ."
-                     timeout 180s npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list
-                     INSPECTOR_EXIT_CODE=$?
+                     # Check if main entry point exists before trying node .
+                     MAIN_FILE=$(node -p "require('./package.json').main || 'index.js'")
+                     if [ -f "$MAIN_FILE" ]; then
+                       timeout 180s npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list
+                       INSPECTOR_EXIT_CODE=$?
+                     else
+                       echo "--> Main entry point '$MAIN_FILE' not found, skipping 'node .' test."
+                     fi
                    fi
                    # Final status based on inspector result
                    if [ $INSPECTOR_EXIT_CODE -eq 0 ]; then
                      SUB_STATUS="SUCCESS"; SUB_REASON="Tested via Node.js run (stdio using '$SERVER_CMD')";
                    else
                      # Check if 'start' or 'main' indicates a non-stdio server might be intended
-                     if node -e "const pkg = require('./package.json'); process.exit( (pkg.scripts?.start && !pkg.scripts.start.includes('stdio')) || (pkg.main && !pkg.main.includes('stdio')) ? 0 : 1 )"; then
+                     IS_HTTP_LIKELY=$(node -e "try { const pkg = require('./package.json'); const start = pkg.scripts?.start || ''; const main = pkg.main || ''; process.exit( (start && !start.includes('stdio')) || (main && !main.includes('stdio')) ? 0 : 1 ) } catch(e){ process.exit(1) }")
+                     if [ "$IS_HTTP_LIKELY" == "0" ]; then
                         SUB_STATUS="SKIPPED"; SUB_REASON="Failed stdio test with 'npm start'/'node .'. Project might intend non-stdio execution (e.g., HTTP server)."
                      else
-                        SUB_STATUS="FAILURE"; SUB_REASON="Inspector failed (Exit code $INSPECTOR_EXIT_CODE) with standard Node commands ('npm start', 'node .')."
+                        SUB_STATUS="FAILURE"; SUB_REASON="Inspector failed (Exit code $INSPECTOR_EXIT_CODE) with standard Node commands ('npm start', 'node .').";
                      fi
                    fi
 
@@ -436,18 +497,27 @@ jobs:
                    SUB_RUN_METHOD="Python (pyproject/requirements)"
                    echo "--> Found Python project. Setting up environment with uv..."
                    # Create venv and activate it
-                   uv venv .venv --seed || { echo "::warning::uv venv failed."; SUB_STATUS="SKIPPED"; SUB_REASON="uv venv failed"; exit 0; }
-                   source .venv/bin/activate || { echo "::warning::venv activation failed."; SUB_STATUS="SKIPPED"; SUB_REASON="venv activation failed"; exit 0; }
-                   echo "--> Running uv sync..."
-                   # Try installing with locking first, fallback to regular sync
-                   if [ -f "requirements.lock" ] || [ -f "uv.lock" ]; then
-                     timeout 300s uv sync --locked || timeout 300s uv sync
+                   uv venv .venv --seed || { echo "::warning::uv venv failed."; SUB_STATUS="SKIPPED"; SUB_REASON="uv venv failed"; trap - EXIT; write_result "$SUB_STATUS" "$SUB_REASON" "$SUB_RUN_METHOD"; exit 0; }
+                   source .venv/bin/activate || { echo "::warning::venv activation failed."; SUB_STATUS="SKIPPED"; SUB_REASON="venv activation failed"; trap - EXIT; write_result "$SUB_STATUS" "$SUB_REASON" "$SUB_RUN_METHOD"; exit 0; }
+                   echo "--> Running uv pip install/sync..."
+                   # Prefer install . over sync if pyproject.toml likely defines the package itself
+                   if [ -f "pyproject.toml" ] && grep -q '\[project\]' pyproject.toml; then
+                      echo "--> Found [project] table, running 'uv pip install .'"
+                      timeout 300s uv pip install .
                    else
-                     timeout 300s uv sync
+                      # Try installing with locking first, fallback to regular sync/install
+                      echo "--> Attempting uv sync/install..."
+                      if [ -f "requirements.lock" ] || [ -f "uv.lock" ]; then
+                        timeout 300s uv sync --locked || timeout 300s uv sync || timeout 300s uv pip install -r requirements.txt # Fallback if sync fails
+                      elif [ -f "requirements.txt" ]; then
+                         timeout 300s uv pip install -r requirements.txt
+                      else # Only pyproject.toml without [project] or requirements
+                         timeout 300s uv sync # Best guess
+                      fi
                    fi
                    SYNC_EXIT_CODE=$?
                    if [ $SYNC_EXIT_CODE -ne 0 ]; then
-                     echo "::warning::uv sync failed (Exit code $SYNC_EXIT_CODE)."; SUB_STATUS="SKIPPED"; SUB_REASON="uv sync failed"; exit 0;
+                     echo "::warning::uv install/sync failed (Exit code $SYNC_EXIT_CODE)."; SUB_STATUS="SKIPPED"; SUB_REASON="uv install/sync failed"; trap - EXIT; write_result "$SUB_STATUS" "$SUB_REASON" "$SUB_RUN_METHOD"; exit 0;
                    fi
                    # Try standard execution methods
                    SERVER_CMD=""
@@ -477,7 +547,7 @@ jobs:
                    if [ $INSPECTOR_EXIT_CODE -ne 0 ]; then
                      # Infer module name from directory, handle dashes
                      PY_MODULE_NAME=$(basename "$PWD" | sed 's/-/_/g')
-                     # Check if the module path actually exists
+                     # Check if the module path actually exists (as dir or .py file)
                      if [ -d "$PY_MODULE_NAME" ] || [ -f "${PY_MODULE_NAME}.py" ]; then
                        echo "--> Trying '$PYTHON_EXEC -m $PY_MODULE_NAME'..."
                        SERVER_CMD="$PYTHON_EXEC -m $PY_MODULE_NAME"
@@ -506,11 +576,12 @@ jobs:
                    timeout 300s go build -o "$BINARY_NAME" .
                    BUILD_EXIT_CODE=$?
                    if [ $BUILD_EXIT_CODE -ne 0 ]; then
-                     echo "::warning::go build failed (Exit code $BUILD_EXIT_CODE)."; SUB_STATUS="SKIPPED"; SUB_REASON="go build failed"; exit 0;
+                     echo "::warning::go build failed (Exit code $BUILD_EXIT_CODE)."; SUB_STATUS="SKIPPED"; SUB_REASON="go build failed"; trap - EXIT; write_result "$SUB_STATUS" "$SUB_REASON" "$SUB_RUN_METHOD"; exit 0;
                    fi
                    if [ ! -f "$BINARY_NAME" ]; then
-                      echo "::error::go build succeeded but binary '$BINARY_NAME' not found."; SUB_STATUS="FAILURE"; SUB_REASON="go build succeeded but binary not found."; exit 1;
+                      echo "::error::go build succeeded but binary '$BINARY_NAME' not found."; SUB_STATUS="FAILURE"; SUB_REASON="go build succeeded but binary not found."; trap - EXIT; write_result "$SUB_STATUS" "$SUB_REASON" "$SUB_RUN_METHOD"; exit 1;
                    fi
+                   chmod +x "$BINARY_NAME" # Ensure it's executable
                    # Try running with stdio argument first, then without
                    SERVER_CMD=""
                    INSPECTOR_EXIT_CODE=1 # Default failure
@@ -540,51 +611,53 @@ jobs:
                    echo "--> No recognized project type found."
                  fi
 
-                 # If we reach here without error and status is still SKIPPED (default)
-                 # and run method was attempted, it means the test logic itself failed internally
-                 # However, the trap handler ensures the determined status (SUCCESS/FAILURE/SKIPPED) is written.
+                 # Explicitly clear the trap and write the final result before exiting normally
+                 trap - EXIT
+                 write_result "$SUB_STATUS" "$SUB_REASON" "$SUB_RUN_METHOD"
                  echo "--- Subshell test logic complete ---"
+                 # Exit with 0 if successful or skipped, 1 if failure (for outer shell checks)
+                 if [[ "$SUB_STATUS" == "FAILURE" ]]; then exit 1; else exit 0; fi
 
                ) > "$SUBSHELL_LOG_FILE" 2>&1 # Redirect stdout/stderr to log file
                SUBSHELL_EXIT_CODE=$?
 
                # --- Process Subshell Results ---
                echo "--> Subshell exited with code: $SUBSHELL_EXIT_CODE"
-               # Display subshell logs for debugging
-               echo "--- Subshell Log ---"
-               cat "$SUBSHELL_LOG_FILE" || echo "INFO: Could not display subshell log file."
-               echo "--- End Subshell Log ---"
+               # Display subshell logs for debugging, especially on failure
+               if [[ "$SUBSHELL_EXIT_CODE" -ne 0 ]] || grep -q 'FAILURE' "$SUBSHELL_RESULT_FILE" 2>/dev/null ; then
+                 echo "--- Subshell Log (Exit Code: $SUBSHELL_EXIT_CODE) ---"
+                 cat "$SUBSHELL_LOG_FILE" || echo "INFO: Could not display subshell log file."
+                 echo "--- End Subshell Log ---"
+               fi
 
                if [ -f "$SUBSHELL_RESULT_FILE" ]; then
                   # Parse results from the file
-                  STATUS=$(grep '^SUB_STATUS=' "$SUBSHELL_RESULT_FILE" | cut -d= -f2)
-                  REASON=$(grep '^SUB_REASON=' "$SUBSHELL_RESULT_FILE" | cut -d= -f2-) # Use '-f2-' to capture reasons with '='
-                  RUN_METHOD=$(grep '^SUB_RUN_METHOD=' "$SUBSHELL_RESULT_FILE" | cut -d= -f2)
+                  # Source the file to get vars (safer than parsing potentially complex reasons)
+                  source "$SUBSHELL_RESULT_FILE"
+                  STATUS=$SUB_STATUS
+                  REASON=$SUB_REASON
+                  RUN_METHOD=$SUB_RUN_METHOD
 
-                  # Refine status based on exit code if needed
-                  if [[ $SUBSHELL_EXIT_CODE -ne 0 && "$STATUS" == "SUCCESS" ]]; then
-                    echo "::warning:: Subshell exited non-zero ($SUBSHELL_EXIT_CODE) but reported SUCCESS. Overriding to FAILURE."
+                  # Refine status based on exit code if needed (already handled by subshell exit 1 on failure)
+                  if [[ $SUBSHELL_EXIT_CODE -ne 0 && "$STATUS" != "FAILURE" ]]; then
+                    echo "::error:: Subshell exited non-zero ($SUBSHELL_EXIT_CODE) but did not report FAILURE. Overriding status."
                     STATUS="FAILURE"
-                    REASON="Test logic reported success but subshell exited unexpectedly (Exit code: $SUBSHELL_EXIT_CODE). Original Reason: $REASON"
-                  elif [[ $SUBSHELL_EXIT_CODE -ne 0 && "$STATUS" == "SKIPPED" ]]; then
-                     echo "::warning:: Subshell exited non-zero ($SUBSHELL_EXIT_CODE) and reported SKIPPED. Treating as FAILURE due to unexpected exit."
-                     STATUS="FAILURE" # Promote skip to failure if subshell crashed unexpectedly
-                     REASON="Test logic reported skipped but subshell exited unexpectedly (Exit code: $SUBSHELL_EXIT_CODE). Original Reason: $REASON"
+                    REASON="Subshell exited unexpectedly (Exit code: $SUBSHELL_EXIT_CODE). Original Status: $SUB_STATUS, Reason: $SUB_REASON"
                   elif [[ $SUBSHELL_EXIT_CODE -eq 0 && "$STATUS" == "FAILURE" ]]; then
-                     echo "INFO: Subshell exited zero but reported FAILURE (likely inspector timeout/failure)."
+                     echo "INFO: Subshell exited zero but reported FAILURE (likely inspector timeout/failure, as expected)."
                   elif [[ $SUBSHELL_EXIT_CODE -ne 0 && "$STATUS" == "FAILURE" ]]; then
                      echo "INFO: Subshell exited non-zero as expected for FAILURE status."
                   fi
 
                else
                  # Result file missing - indicates a major problem in the subshell setup or premature exit
-                 echo "::error:: Subshell result file missing! Subshell likely crashed."
+                 echo "::error:: Subshell result file missing! Subshell likely crashed before writing results."
                  STATUS="FAILURE"
                  REASON="Subshell execution failed catastrophically (Exit code: $SUBSHELL_EXIT_CODE, result file missing)."
                  RUN_METHOD="Unknown" # Can't determine method if results are missing
                fi
 
-               # Ensure default values if parsing failed somehow
+               # Ensure default values if parsing failed somehow (e.g., source failed)
                STATUS=${STATUS:-FAILURE} # Default to Failure if parsing fails
                REASON=${REASON:-"Subshell output parsing error or logic did not complete."}
                RUN_METHOD=${RUN_METHOD:-None}
@@ -607,7 +680,9 @@ jobs:
             echo "--------------------------------------------------"
             echo "" # Newline for readability
 
-            # Store result detail
+            # Store result detail using jq
+            # Ensure jq is available (installed in setup step)
+            command -v jq >/dev/null 2>&1 || { echo "::error:: 'jq' command not found!"; exit 1; }
             RESULT_JSON=$(jq -nc --arg repo "$REPO" --arg status "$STATUS" --arg reason "$REASON" --arg method "$RUN_METHOD" --argjson duration "$DURATION" \
               '{repo: $repo, status: $status, reason: $reason, method: $method, duration: $duration}')
             RESULTS+=("$RESULT_JSON")
@@ -621,18 +696,27 @@ jobs:
             esac
 
             # Use annotations for better visibility in the Actions UI
+            # Escape special characters in reason for annotation robustness
+            ANNOTATION_REASON=$(echo "$REASON" | sed 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')
             if [[ "$STATUS" == "FAILURE" ]]; then
-              echo "::error title=Test Failed [$CURRENT_INDEX/$REPO_COUNT] ${REPO}::Repo=${REPO}, Status=${STATUS}, Method=${RUN_METHOD}, Reason=${REASON}"
+              echo "::error title=Test Failed [$CURRENT_INDEX/$REPO_COUNT] ${REPO}::Repo=${REPO}, Status=${STATUS}, Method=${RUN_METHOD}, Reason=${ANNOTATION_REASON}"
             elif [[ "$STATUS" == "SKIPPED" ]]; then
-              echo "::warning title=Test Skipped [$CURRENT_INDEX/$REPO_COUNT] ${REPO}::Repo=${REPO}, Status=${STATUS}, Method=${RUN_METHOD}, Reason=${REASON}"
+              # Use warning for skipped, unless reason indicates a config issue that might be fixable
+              if [[ "$ANNOTATION_REASON" == *"secret"* || "$ANNOTATION_REASON" == *"not implemented"* ]]; then
+                 echo "::notice title=Test Skipped [$CURRENT_INDEX/$REPO_COUNT] ${REPO}::Repo=${REPO}, Status=${STATUS}, Method=${RUN_METHOD}, Reason=${ANNOTATION_REASON}"
+              else
+                 echo "::warning title=Test Skipped [$CURRENT_INDEX/$REPO_COUNT] ${REPO}::Repo=${REPO}, Status=${STATUS}, Method=${RUN_METHOD}, Reason=${ANNOTATION_REASON}"
+              fi
             else # SUCCESS
-               echo "::notice title=Test Passed [$CURRENT_INDEX/$REPO_COUNT] ${REPO}::Repo=${REPO}, Status=${STATUS}, Method=${RUN_METHOD}, Reason=${REASON}"
+               echo "::notice title=Test Passed [$CURRENT_INDEX/$REPO_COUNT] ${REPO}::Repo=${REPO}, Status=${STATUS}, Method=${RUN_METHOD}, Reason=${ANNOTATION_REASON}"
             fi
 
             # --- D. Cleanup for next iteration ---
             echo "--> Cleaning up checkout directory ${CHECKOUT_PATH}..."
-            rm -rf "$CHECKOUT_PATH"
+            # Add error handling for rm -rf just in case
+            rm -rf "$CHECKOUT_PATH" || echo "::warning:: Failed to remove checkout directory $CHECKOUT_PATH"
             # Optional: More aggressive Docker cleanup (only if needed, can slow things down)
+            # Consider running prune less frequently or only if disk space becomes an issue
             # echo "--> Pruning Docker images (ones without containers)..."
             # docker image prune -f || echo "INFO: Docker image prune failed."
 
@@ -663,21 +747,33 @@ jobs:
           echo "======================================================================"
 
 
-          # Output detailed results as JSON artifact (optional)
+          # Output detailed results as JSON artifact (optional, but useful)
 
-          # echo "Detailed Results:"
+          echo "Generating detailed results JSON..."
 
-          # printf "%s\n" "${RESULTS[@]}" | jq -s . > detailed_results.json
+          # Combine the JSON fragments into a single array
 
-          # echo "Detailed results saved to detailed_results.json"
+          printf "%s\n" "${RESULTS[@]}" | jq -s . > detailed_results.json
 
-          # Could upload artifact here if needed
+          echo "Detailed results saved to detailed_results.json"
 
+
+          # --- F. Upload Artifact ---
+
+          # Always upload results, helps diagnose failures/skips
+
+          - name: Upload Detailed Results
+            uses: actions/upload-artifact@v4
+            with:
+              name: detailed-test-results
+              path: detailed_results.json
+
+          # --- G. Final Job Status ---
 
           # Fail the entire job if any failures occurred
 
           if [ "$FAILURE_COUNT" -gt 0 ]; then
-            echo "::error::One or more server tests failed! See logs and annotations above for details."
+            echo "::error::One or more server tests failed! See logs, annotations, and the detailed-test-results artifact for details."
             exit 1
           else
             echo "All applicable server tests passed or were skipped."
