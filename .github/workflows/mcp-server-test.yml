@@ -1,0 +1,315 @@
+# Workflow name
+name: MCP Server Awesome List Tests
+
+# Triggers: Manual dispatch and weekly schedule
+on:
+  workflow_dispatch: # Allows manual triggering from the Actions tab
+  schedule:
+    - cron: '0 4 * * 1' # Run weekly (e.g., every Monday at 4 AM UTC)
+
+jobs:
+  # ==============================================================
+  # Job 1: Fetch the server list from the forked repository README
+  # ==============================================================
+  fetch_list:
+    name: Fetch and Parse Awesome MCP List
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.parse_list.outputs.matrix }} # JSON string array of "owner/repo" names
+      count: ${{ steps.parse_list.outputs.count }}   # Total count for progress display
+    steps:
+      - name: Checkout Forked Awesome MCP Servers List Repo
+        uses: actions/checkout@v4
+        with:
+          repository: Acid-base/awesome-mcp-servers # <-- YOUR FORK
+          path: awesome-list-fork # Checkout to a specific path
+
+      - name: Parse README for Repo URLs
+        id: parse_list
+        working-directory: ./awesome-list-fork # Operate within the checked-out path
+        run: |
+          echo "Parsing README.md between '## Server Implementations' and '## Frameworks'..."
+          # awk: Extracts lines between the specified headers
+          # grep: Finds lines with the target git repo URLs within that section
+          # grep -oE: Extracts only the matching URLs
+          # sed: Removes the domain prefix to get 'owner/repo'
+          # sort -u: Ensures uniqueness
+          # jq: Formats the list into a JSON array string
+          REPOS=$(awk '/^## Server Implementations/{flag=1; next} /^## Frameworks/{flag=0} flag' README.md | \
+                  grep -oE 'https?:\/\/(github\.com|gitlab\.com|gitea\.com)\/[^/]+\/[^)/ ]+' | \
+                  sed -E 's/https?:\/\/(github\.com|gitlab\.com|gitea\.com)\///' | \
+                  sort -u )
+
+          if [ -z "$REPOS" ]; then
+             echo "::error::Failed to extract any repository URLs from the README in the fork."
+             exit 1
+          fi
+
+          # Count lines for reporting
+          REPO_COUNT=$(echo "$REPOS" | wc -l)
+          echo "Found $REPO_COUNT potential servers in the forked list."
+
+          # Convert to JSON array string
+          JSON_MATRIX=$(echo "$REPOS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+          echo "matrix=$JSON_MATRIX" >> $GITHUB_OUTPUT
+          echo "count=$REPO_COUNT" >> $GITHUB_OUTPUT
+
+  # ==============================================================
+  # Job 2: Test each server using a matrix strategy
+  # ==============================================================
+  test_server:
+    name: Test (${{ strategy.job-index + 1 }}/${{ needs.fetch_list.outputs.count }}) ${{ strategy.matrix.repo }} # Dynamic job name
+    needs: fetch_list # Depends on the list being successfully fetched
+    if: ${{ needs.fetch_list.outputs.matrix != '[]' }} # Only run if the list is not empty
+    runs-on: ubuntu-latest # Needs Docker available
+    strategy:
+      fail-fast: false # Important: Allows other tests in the matrix to continue if one fails
+      matrix:
+        repo: ${{ fromJson(needs.fetch_list.outputs.matrix) }} # Define the matrix from the output of fetch_list
+
+    steps:
+      # Step 1: Setup essential prerequisites for testing various server types
+      - name: Setup Prerequisites (Node, uv, Go, Deno)
+        run: |
+          echo "Setting up Node.js, uv, Go, Deno..."
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg git # Ensure basics are present
+          # Node.js v20 (needed for mcp-inspector and some servers)
+          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+          sudo apt-get install -y nodejs
+          echo "Node Version: $(node --version)"
+          echo "NPM Version: $(npm --version)"
+          # uv (for Python dependency management)
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.cargo/bin:$PATH" # Add uv to PATH
+          echo "uv Version: $(uv --version)"
+          # Go (for Go-based servers)
+          sudo add-apt-repository ppa:longsleep/golang-backports -y
+          sudo apt-get update
+          sudo apt-get install -y golang-go
+          echo "Go Version: $(go version)"
+          # Deno (for Deno-based servers like pydantic/mcp-run-python)
+          curl -fsSL https://deno.land/install.sh | sh
+          export DENO_INSTALL="$HOME/.deno"
+          export PATH="$DENO_INSTALL/bin:$PATH" # Add deno to PATH
+          echo "Deno Version: $(deno --version)"
+          # Verify Docker client (Docker daemon runs on GitHub runners)
+          docker --version
+
+      # Step 2: Checkout the specific MCP server repository identified by the matrix
+      - name: Checkout MCP Server Repository (${{ strategy.matrix.repo }})
+        id: checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ strategy.matrix.repo }} # The current server repo from the matrix
+          path: mcp_server_under_test # Checkout into a specific subdirectory
+          submodules: 'recursive' # Try fetching submodules if any exist
+          fetch-depth: 1 # Fetch only the latest commit to save time/space
+        continue-on-error: true # Allow workflow to continue to the next step even if checkout fails
+
+      # Step 3: Execute the prioritized testing logic
+      - name: Run Test Logic for ${{ strategy.matrix.repo }}
+        id: test-logic
+        working-directory: ./mcp_server_under_test # Change CWD for file checks inside the checked-out repo
+        timeout-minutes: 10 # Set a timeout for the entire test logic block
+        env:
+          # Make the PAT secret available if testing github/github-mcp-server
+          # IMPORTANT: Ensure you create this secret in your repository settings!
+          GH_MCP_TOKEN: ${{ secrets.MCP_TESTER_GITHUB_PAT }}
+          # Add uv and deno to PATH for subsequent commands within this step
+          PATH: "$HOME/.cargo/bin:$HOME/.deno/bin:$PATH"
+        run: |
+          # Default status and reason
+          STATUS="SKIPPED"
+          REASON="Unknown reason"
+          RUN_METHOD="None"
+
+          # --- A. Check if checkout failed ---
+          if [ ${{ steps.checkout.outcome }} != 'success' ] || [ ! -d "." ] || [ -z "$(ls -A .)" ]; then
+            REASON="Checkout failed or repository empty"
+            echo "status=$STATUS" >> $GITHUB_OUTPUT; echo "reason=$REASON" >> $GITHUB_OUTPUT; echo "run_method=$RUN_METHOD" >> $GITHUB_OUTPUT
+            exit 0 # Exit step successfully, overall status is SKIPPED
+          fi
+          echo "INFO: Checkout successful for ${{ strategy.matrix.repo }}"
+
+          # --- B. Start Prioritized Test Execution Logic ---
+          set -e # Exit script immediately if any command below fails (unless handled)
+
+          # --- Priority 1: Known Specific Servers with Reliable Run Methods ---
+          if [[ "${{ strategy.matrix.repo }}" == "github/github-mcp-server" ]]; then
+            RUN_METHOD="Docker Image (Official GitHub)"
+            echo "INFO: Matched specific server: github/github-mcp-server"
+            if [ -z "$GH_MCP_TOKEN" ]; then
+              set +e; echo "::warning::Required secret MCP_TESTER_GITHUB_PAT not set."; set -e
+              STATUS="SKIPPED"; REASON="Required secret MCP_TESTER_GITHUB_PAT not set"
+            else
+              SERVER_CMD="docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN=$GH_MCP_TOKEN ghcr.io/github/github-mcp-server"
+              echo "INFO: Testing with command: $SERVER_CMD"
+              npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS" || STATUS="FAILURE"
+              REASON="Tested via Docker Image (stdio)"
+            fi
+
+          elif [[ "${{ strategy.matrix.repo }}" == "microsoft/playwright-mcp" ]]; then
+            # Playwright might need specific setup for headless CI runs. This is a best guess.
+            RUN_METHOD="npx @playwright/mcp"
+            echo "INFO: Matched specific server: microsoft/playwright-mcp"
+            SERVER_CMD="npx --yes @playwright/mcp@latest --headless" # Attempt headless mode
+            echo "INFO: Testing with command: $SERVER_CMD"
+            npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS" || STATUS="FAILURE"
+            REASON="Tested via npx (stdio)"
+
+          elif [[ "${{ strategy.matrix.repo }}" == *"pydantic/mcp-run-python"* || "${{ strategy.matrix.repo }}" == "pydantic/pydantic-ai" ]]; then
+            # Need to handle this slightly differently as it runs directly via Deno
+            RUN_METHOD="deno run jsr:"
+            echo "INFO: Matched specific server: pydantic/mcp-run-python"
+            echo "INFO: Running Deno warmup..."
+            deno run -A --node-modules-dir=auto jsr:@pydantic/mcp-run-python warmup || { echo "::error::Deno warmup failed"; STATUS="FAILURE"; REASON="Deno warmup failed"; }
+            if [[ "$STATUS" != "FAILURE" ]]; then
+               SERVER_CMD="deno run -A --node-modules-dir=auto jsr:@pydantic/mcp-run-python stdio"
+               echo "INFO: Testing with command: $SERVER_CMD"
+               npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS" || STATUS="FAILURE"
+               REASON="Tested via Deno (stdio)"
+            fi
+
+          # --- Priority 2: Docker Compose (Detect only, test via Dockerfile if present) ---
+          elif [ -f "docker-compose.yml" ] || [ -f "compose.yml" ]; then
+            RUN_METHOD="Docker Compose (Detected)"
+            echo "INFO: Found docker-compose.yml. Strong indicator of deployability."
+            # Fallback: Attempt Dockerfile test if available
+            if [ -f "Dockerfile" ]; then
+               echo "INFO: Attempting Dockerfile test as fallback..."
+               RUN_METHOD="Dockerfile (Compose Fallback)"
+               docker build -t mcp-test-image-${{ github.run_id }}-${{ strategy.job-index }} . || { set +e; echo "::warning::docker build failed."; set -e; STATUS="SKIPPED"; REASON="docker build failed"; }
+               if [[ "$STATUS" != "SKIPPED" ]]; then
+                  HOST_PORT=$((6000 + ${{ strategy.job-index }})) # Assign unique host port per job
+                  INTERNAL_PORT=8080 # Guess common ports
+                  docker run -d --rm --name mcp-server-test-${{ strategy.job-index }} -p ${HOST_PORT}:${INTERNAL_PORT} mcp-test-image-${{ github.run_id }}-${{ strategy.job-index }} && sleep 15 || \
+                    { INTERNAL_PORT=6277; docker run -d --rm --name mcp-server-test-${{ strategy.job-index }} -p ${HOST_PORT}:${INTERNAL_PORT} mcp-test-image-${{ github.run_id }}-${{ strategy.job-index }} && sleep 15; } || \
+                    { set +e; echo "::error::Failed to start container via Dockerfile on common ports 8080 or 6277."; set -e; STATUS="FAILURE"; REASON="docker run failed"; }
+
+                  if [[ "$STATUS" != "FAILURE" ]]; then
+                     echo "INFO: Testing SSE endpoint http://localhost:${HOST_PORT}/sse"
+                     npx --yes @modelcontextprotocol/inspector --cli http://localhost:${HOST_PORT}/sse --method tools/list && STATUS="SUCCESS" || STATUS="FAILURE"
+                     REASON="Tested via Dockerfile build/run (SSE)"
+                  fi
+                  # Cleanup container
+                  set +e; docker stop mcp-server-test-${{ strategy.job-index }} > /dev/null 2>&1 || true; set -e
+               fi
+            else
+               STATUS="SKIPPED"
+               REASON="docker-compose.yml found, but no Dockerfile for fallback test and direct compose testing not implemented."
+            fi
+
+          # --- Priority 3: Dockerfile (If Compose wasn't found) ---
+          elif [ -f "Dockerfile" ]; then
+             RUN_METHOD="Dockerfile"
+             echo "INFO: Found Dockerfile. Attempting build and run..."
+             docker build -t mcp-test-image-${{ github.run_id }}-${{ strategy.job-index }} . || { set +e; echo "::warning::docker build failed."; set -e; STATUS="SKIPPED"; REASON="docker build failed"; }
+             if [[ "$STATUS" != "SKIPPED" ]]; then
+                HOST_PORT=$((6000 + ${{ strategy.job-index }})) # Unique host port
+                INTERNAL_PORT=8080 # Guess common ports
+                docker run -d --rm --name mcp-server-test-${{ strategy.job-index }} -p ${HOST_PORT}:${INTERNAL_PORT} mcp-test-image-${{ github.run_id }}-${{ strategy.job-index }} && sleep 15 || \
+                  { INTERNAL_PORT=6277; docker run -d --rm --name mcp-server-test-${{ strategy.job-index }} -p ${HOST_PORT}:${INTERNAL_PORT} mcp-test-image-${{ github.run_id }}-${{ strategy.job-index }} && sleep 15; } || \
+                  { set +e; echo "::error::Failed to start container via Dockerfile on common ports 8080 or 6277."; set -e; STATUS="FAILURE"; REASON="docker run failed"; }
+
+                if [[ "$STATUS" != "FAILURE" ]]; then
+                   echo "INFO: Testing SSE endpoint http://localhost:${HOST_PORT}/sse"
+                   npx --yes @modelcontextprotocol/inspector --cli http://localhost:${HOST_PORT}/sse --method tools/list && STATUS="SUCCESS" || STATUS="FAILURE"
+                   REASON="Tested via Dockerfile build/run (SSE)"
+                fi
+                # Cleanup container
+                set +e; docker stop mcp-server-test-${{ strategy.job-index }} > /dev/null 2>&1 || true; set -e
+             fi
+
+          # --- Priority 4: package.json (Node.js) ---
+          elif [ -f "package.json" ]; then
+             RUN_METHOD="Node.js (package.json)"
+             echo "INFO: Found package.json. Attempting npm install and run..."
+             npm install || { set +e; echo "::warning::npm install failed."; set -e; STATUS="SKIPPED"; REASON="npm install failed"; }
+             if [[ "$STATUS" != "SKIPPED" ]]; then
+                # Try standard start commands (add more guesses if needed)
+                SERVER_CMD="node ."
+                echo "INFO: Testing with command: $SERVER_CMD"
+                npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS" || \
+                  { SERVER_CMD="npm start"; echo "INFO: Testing with command: $SERVER_CMD"; npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS"; } || \
+                  { set +e; echo "::error::Failed to run with standard Node commands (node . or npm start)."; set -e; STATUS="FAILURE"; }
+                REASON="Tested via Node.js run (stdio)"
+             fi
+
+          # --- Priority 5: pyproject.toml / requirements.txt (Python) ---
+          elif [ -f "pyproject.toml" ] || [ -f "requirements.txt" ]; then
+              RUN_METHOD="Python (pyproject/requirements)"
+              echo "INFO: Found Python project file. Attempting uv sync and run..."
+              uv venv .venv || echo "INFO: Failed creating venv, maybe one exists or not needed." # Create venv (best effort)
+              source .venv/bin/activate || echo "INFO: Failed activating venv, maybe system python is intended." # Activate (best effort)
+              # Install dependencies
+              uv sync --frozen || uv sync || { set +e; echo "::warning::uv sync failed."; set -e; STATUS="SKIPPED"; REASON="uv sync failed"; }
+              if [[ "$STATUS" != "SKIPPED" ]]; then
+                  # Try standard start commands
+                  SERVER_CMD="python main.py"
+                  echo "INFO: Testing with command: $SERVER_CMD"
+                  npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS" || \
+                    { SERVER_CMD="python app.py"; echo "INFO: Testing with command: $SERVER_CMD"; npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS"; } || \
+                    { SERVER_CMD="python server.py"; echo "INFO: Testing with command: $SERVER_CMD"; npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS"; } || \
+                    { set +e; echo "::error::Failed to run with standard Python commands (main.py, app.py, server.py)."; set -e; STATUS="FAILURE"; }
+                  REASON="Tested via Python run (stdio)"
+              fi
+
+          # --- Priority 6: go.mod (Go) ---
+          elif [ -f "go.mod" ]; then
+              RUN_METHOD="Go (go.mod)"
+              echo "INFO: Found go.mod. Attempting go build and run..."
+              go build -o mcp-server-binary . || { set +e; echo "::warning::go build failed."; set -e; STATUS="SKIPPED"; REASON="go build failed"; }
+              if [[ "$STATUS" != "SKIPPED" ]]; then
+                 # Try standard start commands (often needs 'stdio' arg)
+                 SERVER_CMD="./mcp-server-binary stdio"
+                 echo "INFO: Testing with command: $SERVER_CMD"
+                 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS" || \
+                    { SERVER_CMD="./mcp-server-binary"; echo "INFO: Testing with command: $SERVER_CMD"; npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS"; } || \
+                    { set +e; echo "::error::Failed to run with standard Go commands (./binary stdio or ./binary)."; set -e; STATUS="FAILURE"; }
+                 REASON="Tested via Go build/run (stdio)"
+              fi
+
+          # --- Priority 7: No Method Found ---
+          else
+              RUN_METHOD="None"
+              STATUS="SKIPPED"
+              REASON="No specific method known and no standard Dockerfile, compose, package.json, python files, or go.mod found."
+          fi
+
+          set +e # Disable exit on error before setting outputs
+
+          # --- C. Output Results ---
+          echo "Final Status: $STATUS"
+          echo "Final Reason: $REASON"
+          echo "Run Method Used/Detected: $RUN_METHOD"
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "reason=$REASON" >> $GITHUB_OUTPUT
+          echo "run_method=$RUN_METHOD" >> $GITHUB_OUTPUT
+
+      # Step 4: Report the final result for this specific server job
+      - name: Report Result for ${{ strategy.matrix.repo }}
+        run: |
+          STATUS=${{ steps.test-logic.outputs.status }}
+          REASON=${{ steps.test-logic.outputs.reason }}
+          RUN_METHOD=${{ steps.test-logic.outputs.run_method }}
+          REPO=${{ strategy.matrix.repo }}
+
+          echo "" # Newline for readability
+          echo "--- Test Result [${{ strategy.job-index + 1 }}/${{ needs.fetch_list.outputs.count }}] :: ${REPO} ---"
+          echo "- Run Method Attempted: ${RUN_METHOD}"
+          echo "- Outcome: ${STATUS}"
+          echo "- Details: ${REASON}"
+          echo "--------------------------------------------------"
+          echo "" # Newline for readability
+
+          # Use annotations for better visibility in the Actions UI
+          if [[ "$STATUS" == "FAILURE" ]]; then
+            echo "::error::Test failed for ${REPO} - ${REASON}"
+            # Decide if a failed test should fail the whole workflow run eventually
+            # exit 1 # Uncomment this line to make the job fail on test failure
+          elif [[ "$STATUS" == "SKIPPED" ]]; then
+            echo "::notice::Test skipped for ${REPO} - ${REASON}"
+          else # SUCCESS
+             echo "Test passed for ${REPO} using ${RUN_METHOD}"
+          fi
