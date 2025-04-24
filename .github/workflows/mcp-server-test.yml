@@ -16,7 +16,7 @@ on:
         type: number
         default: 0
   schedule:
-    - cron: 0 5 * * 1  # Monday at 5:00 UTC weekly
+    - cron: '0 5 * * 1' # Monday at 5:00 UTC weekly (Corrected quotes)
 
 env:
   NODE_VERSION: 20
@@ -72,7 +72,6 @@ jobs:
           echo "count=$REPO_COUNT" >> $GITHUB_OUTPUT
 
           # Create a JSON matrix ONLY if parallel testing is enabled
-          # CORRECTED Matrix format: {"include": [{"repo": "owner1/repo1"}, {"repo": "owner2/repo2"}, ...]}
           IS_PARALLEL="${{ github.event.inputs.parallel_testing || false }}" # Default to false
           if [[ "$IS_PARALLEL" == "true" ]]; then
             echo "Creating matrix for parallel testing..."
@@ -81,7 +80,10 @@ jobs:
             MATRIX_JSON=$(cat ../matrix.json)
             # Ensure the JSON is valid before outputting
             if jq '.' ../matrix.json > /dev/null 2>&1; then
-              echo "matrix=${MATRIX_JSON}" >> $GITHUB_OUTPUT
+              # Use YAML multiline string syntax for potentially large JSON output
+              echo "matrix<<EOF" >> $GITHUB_OUTPUT
+              echo "${MATRIX_JSON}" >> $GITHUB_OUTPUT
+              echo "EOF" >> $GITHUB_OUTPUT
               echo "Generated parallel matrix with ${REPO_COUNT} entries."
             else
               echo "::error::Generated matrix JSON is invalid!"
@@ -112,7 +114,10 @@ jobs:
   # Job 2: Test Servers (Parallel or Sequential)
   # ==============================================================
   test-servers:
-    name: ${{ github.event.inputs.parallel_testing == 'true' && format('Test Server: {0}', matrix.repo) || 'Test All MCP Servers Sequentially' }}
+    # ***** CORRECTED NAME LINE *****
+    # Use YAML block scalar syntax to ensure the expression is treated as a single string
+    name: |
+      ${{ github.event.inputs.parallel_testing == true && format('Test Server: {0}', matrix.repo) || 'Test All MCP Servers Sequentially' }}
     needs: prepare-server-list
     runs-on: ubuntu-latest
     # Timeout applies PER JOB instance (important for parallel)
@@ -129,93 +134,81 @@ jobs:
           name: repo-list
           path: . # Download to current directory
 
-      # ***** START OF CORRECTED CACHE STEP *****
+      # Cache step (previously corrected, ensure indentation is still valid)
       - name: Setup Tool Versions Cache
-        id: tool-versions-cache # Consistent ID
-        uses: actions/cache@v4 # Use latest cache action
+        id: tool-versions-cache
+        uses: actions/cache@v4
         with:
-          # Correctly indented path list matching install locations
           path: |
             ~/.cache/uv
             ~/.local/bin
             ~/.cargo/bin
             ~/.deno
             /usr/local/go
-            /opt/hostedtoolcache # Keep this for potential Node caching
-          # Primary cache key
-          key: ${{ runner.os }}-tools-cache-${{ env.NODE_VERSION }}-${{ env.GO_VERSION }}-v2 # Increment cache version
-          # Restore keys for partial matches
+            /opt/hostedtoolcache
+          key: ${{ runner.os }}-tools-cache-${{ env.NODE_VERSION }}-${{ env.GO_VERSION }}-v2
           restore-keys: |
             ${{ runner.os }}-tools-cache-${{ env.NODE_VERSION }}-${{ env.GO_VERSION }}-
-      # ***** END OF CORRECTED CACHE STEP *****
 
       # Setup tools, using cache information if possible
       - name: Setup Prerequisites
         shell: bash -eo pipefail {0}
         run: |
           echo "Setting up tools and dependencies..."
-
           # Install base packages unconditionally
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg git coreutils jq net-tools # Added net-tools for netstat
           echo "Installed base packages (including jq, net-tools)."
 
-          # Setup Node.js (using apt is usually fast)
+          # Setup Node.js
           echo "Setting up Node.js v${{ env.NODE_VERSION }}..."
-          # Check if correct version is already available
           if ! node --version 2>/dev/null | grep -q "v${{ env.NODE_VERSION }}."; then
             curl -fsSL https://deb.nodesource.com/setup_${{ env.NODE_VERSION }}.x | sudo -E bash -
             sudo apt-get install -y nodejs
           else
             echo "Node.js v${{ env.NODE_VERSION }} already installed or cached."
           fi
-          echo "Node Version: $(node --version)"
-          echo "NPM Version: $(npm --version)"
+          echo "Node Version: $(node --version)"; echo "NPM Version: $(npm --version)"
 
-          # Setup uv (installs to ~/.local/bin now)
+          # Setup uv
           if ! command -v uv &> /dev/null; then
-            echo "Setting up uv (not found or not cached)..."
-            curl -LsSf https://astral.sh/uv/install.sh | sh
+            echo "Setting up uv (not found or not cached)..."; curl -LsSf https://astral.sh/uv/install.sh | sh
           else
             echo "uv found (cached or pre-installed)."
           fi
           export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH" # Ensure uv is in PATH
           echo "uv Version: $(uv --version || echo 'uv not found')"
 
-
-          # Setup Go (checks cache path and version)
+          # Setup Go
+          # Use cache step output to potentially skip download/install
           INSTALLED_GO_VERSION=$(go version 2>/dev/null | awk '{print $3}' | sed 's/go//')
+          # Check if cache was hit AND go directory exists AND version matches
           if [[ "${{ steps.tool-versions-cache.outputs.cache-hit }}" != 'true' || ! -d "/usr/local/go" || "$INSTALLED_GO_VERSION" != "${{ env.GO_VERSION }}" ]]; then
              echo "Setting up Go ${{ env.GO_VERSION }} (not cached or wrong version)..."
              curl -fsSL "https://golang.org/dl/go${{ env.GO_VERSION }}.linux-amd64.tar.gz" -o go.tar.gz
-             sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf go.tar.gz
-             rm go.tar.gz
+             sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf go.tar.gz; rm go.tar.gz
           else
              echo "Go ${{ env.GO_VERSION }} found and cached."
           fi
           export PATH="/usr/local/go/bin:$PATH" # Ensure Go is in PATH
           echo "Go Version: $(go version)"
 
-          # Setup Deno (checks cache path)
+          # Setup Deno
+          # Use cache step output to potentially skip download/install
           if [[ "${{ steps.tool-versions-cache.outputs.cache-hit }}" != 'true' || ! -d "$HOME/.deno" ]]; then
-             echo "Setting up Deno (not cached)..."
-             curl -fsSL https://deno.land/install.sh | sh
+             echo "Setting up Deno (not cached)..."; curl -fsSL https://deno.land/install.sh | sh
           else
-            echo "Deno found and cached."
+             echo "Deno found and cached."
           fi
-          export DENO_INSTALL="$HOME/.deno" # Ensure Deno is in PATH
-          export PATH="$DENO_INSTALL/bin:$PATH"
+          export DENO_INSTALL="$HOME/.deno"; export PATH="$DENO_INSTALL/bin:$PATH" # Ensure Deno is in PATH
           echo "Deno Version: $(deno --version)"
 
           # Verify Docker
-          echo "Verifying Docker..."
-          docker --version
+          echo "Verifying Docker..."; docker --version
 
-          # Persist the final PATH for subsequent steps
-          # Order: User local bins, Go, Deno, Cargo, existing PATH
+          # Persist the final PATH for subsequent steps in this job
           FINAL_PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.deno/bin:/usr/local/go/bin:${PATH}"
-          echo "Final PATH for subsequent steps: $FINAL_PATH"
-          echo "PATH=$FINAL_PATH" >> $GITHUB_ENV
+          echo "Final PATH for subsequent steps: $FINAL_PATH"; echo "PATH=$FINAL_PATH" >> $GITHUB_ENV
 
       # Find available ports dynamically for this job instance
       - name: Get Available Ports
@@ -223,18 +216,19 @@ jobs:
         shell: bash -eo pipefail {0}
         run: |
           echo "Identifying available ports for testing..."
-          JOB_INDEX=${{ strategy.job-index || 0 }} # Default to 0 for sequential run
-          PORT_OFFSET=$(( JOB_INDEX * 5 )) # Allocate 5 ports per job index
+          JOB_INDEX=${{ strategy.job-index || 0 }}; PORT_OFFSET=$(( JOB_INDEX * 5 ))
           BASE_PORT=$(( ${{ env.BASE_HOST_PORT }} + PORT_OFFSET ))
           echo "Base port for this job instance (Index: $JOB_INDEX): $BASE_PORT"
-          available_ports=()
-          attempts=0; max_attempts=50; current_port=$BASE_PORT
+          available_ports=(); attempts=0; max_attempts=50; current_port=$BASE_PORT
           while [[ ${#available_ports[@]} -lt 5 && $attempts -lt $max_attempts ]]; do
-            if ! netstat -tuln | grep -q ":${current_port} "; then available_ports+=($current_port); fi
+            # Use netstat -lntp to avoid grep issues with partial matches, check state LISTEN
+            if ! sudo netstat -lntp | awk '{print $4}' | grep -q ":${current_port}$"; then
+              available_ports+=($current_port)
+            fi
             current_port=$((current_port + 1)); attempts=$((attempts + 1))
           done
           if [[ ${#available_ports[@]} -lt 5 ]]; then
-            echo "::warning::Could not find 5 available ports starting from $BASE_PORT. Using random high ports."
+            echo "::warning::Could not find 5 available consecutive ports starting from $BASE_PORT. Using random high ports."
             needed=$(( 5 - ${#available_ports[@]} )); readarray -t random_ports < <(shuf -i 15000-25000 -n $needed)
             available_ports+=("${random_ports[@]}"); available_ports=("${available_ports[@]:0:5}")
           fi
@@ -255,10 +249,7 @@ jobs:
         run: |
           mkdir -p test_results
 
-          # ========================================================
           # === Test Server Function Definition ===
-          # (Includes helper functions inside for encapsulation)
-          # ========================================================
           test_server() {
             local REPO="$1"; local INDEX="$2"; local TOTAL="$3"
             if [ -z "$REPO" ]; then echo "::warning::Empty repo name. Skipping."; return; fi
@@ -272,96 +263,402 @@ jobs:
             local REASON="Test logic did not complete."; local RUN_METHOD="None"; local TEST_START_TIME=$(date +%s)
             local TEST_LOG="${GITHUB_WORKSPACE}/test_results/${REPO_SLUG}.log"
             local RESULT_FILE="${GITHUB_WORKSPACE}/test_results/${REPO_SLUG}.json"
+            # Correctly determine port for this specific test within the job
             local PORT_INDEX=$(( (INDEX - 1) % 5 + 1 )); local HOST_PORT=$(printenv "PORT${PORT_INDEX}")
+            if [ -z "$HOST_PORT" ]; then echo "::error::Could not determine HOST_PORT for index $INDEX (PORT_INDEX $PORT_INDEX)."; HOST_PORT="8888"; fi # Fallback port
 
-            record_result() { # Helper function definition START
-              local res_status="$1"; local res_reason="$2"; local res_method="$3"
-              local duration=$(($(date +%s) - TEST_START_TIME))
-              echo; echo "--- Test Result [$INDEX/$TOTAL] :: ${REPO} ---" | tee -a "$TEST_LOG"
-              echo "- Method: ${res_method}" | tee -a "$TEST_LOG"; echo "- Outcome: ${res_status}" | tee -a "$TEST_LOG"
-              echo "- Details: ${res_reason}" | tee -a "$TEST_LOG"; echo "- Duration: ${duration}s" | tee -a "$TEST_LOG"
-              echo "--------------------------------------------------" | tee -a "$TEST_LOG"
-              command -v jq >/dev/null 2>&1 || { echo "::error:: 'jq' command not found for results!"; return 1; }
-              jq -nc --arg repo "$REPO" --arg status "$res_status" --arg reason "$res_reason" \
-                 --arg method "$res_method" --argjson duration "$duration" \
-                 '{repo: $repo, status: $status, reason: $reason, method: $method, duration: $duration}' > "$RESULT_FILE"
-              local ANNOTATION_REASON=$(echo "$res_reason" | sed 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')
-              if [[ "$res_status" == "FAILURE" ]]; then echo "::error title=Test Failed [$INDEX/$TOTAL] ${REPO}::Repo=${REPO}, Status=${res_status}, Method=${res_method}, Reason=${ANNOTATION_REASON}"; return 1;
-              elif [[ "$res_status" == "SKIPPED" ]]; then echo "::warning title=Test Skipped [$INDEX/$TOTAL] ${REPO}::Repo=${REPO}, Status=${res_status}, Method=${res_method}, Reason=${ANNOTATION_REASON}"; return 0;
-              else echo "::notice title=Test Passed [$INDEX/$TOTAL] ${REPO}::Repo=${REPO}, Status=${res_status}, Method=${res_method}, Reason=${ANNOTATION_REASON}"; return 0; fi
-            } # Helper function definition END
 
-            run_inspector_test() { # Helper function definition START
-              local server_cmd="$1"; local test_name="$2"; local test_type="${3:-stdio}"
-              echo "--> Testing with Inspector ($test_type): $test_name"
-              local inspector_cmd; local inspector_timeout="180s"
-              if [[ "$test_type" == "stdio" ]]; then inspector_cmd=(timeout "$inspector_timeout" npx --yes @modelcontextprotocol/inspector --cli "$server_cmd" --method tools/list)
-              elif [[ "$test_type" == "sse" ]]; then inspector_cmd=(timeout "$inspector_timeout" npx --yes @modelcontextprotocol/inspector --cli "$server_cmd" --method tools/list)
-              else echo "::error::Unknown inspector test type: $test_type"; return 1; fi
-              echo "--> Running inspector command: ${inspector_cmd[*]}"
-              "${inspector_cmd[@]}"; local exit_code=$?
-              if [[ $exit_code -eq 0 ]]; then echo "--> Inspector test PASSED for $test_name ($test_type)."; return 0;
-              else echo "::warning::Inspector test FAILED (Exit code: $exit_code) for $test_name ($test_type)."; return 1; fi
-            } # Helper function definition END
+            # Helper function to record the result (JSON and Annotation)
+            record_result() { # Helper START
+              local res_status="$1"; local res_reason="$2"; local res_method="$3"; local duration=$(($(date +%s) - TEST_START_TIME))
+              echo; echo "--- Test Result [$INDEX/$TOTAL] :: ${REPO} ---" | tee -a "$TEST_LOG"; echo "- Method: ${res_method}" | tee -a "$TEST_LOG"; echo "- Outcome: ${res_status}" | tee -a "$TEST_LOG"; echo "- Details: ${res_reason}" | tee -a "$TEST_LOG"; echo "- Duration: ${duration}s" | tee -a "$TEST_LOG"; echo "--------------------------------------------------" | tee -a "$TEST_LOG"
+              command -v jq >/dev/null 2>&1 || { echo "::error:: 'jq' not found!"; return 1; }; jq -nc --arg repo "$REPO" --arg status "$res_status" --arg reason "$res_reason" --arg method "$res_method" --argjson duration "$duration" '{repo: $repo, status: $status, reason: $reason, method: $method, duration: $duration}' > "$RESULT_FILE"
+              local ANNOTATION_REASON=$(echo "$res_reason" | sed 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g');
+              if [[ "$res_status" == "FAILURE" ]]; then
+                echo "::error title=Test Failed [$INDEX/$TOTAL] ${REPO}::Repo=${REPO}, Status=${res_status}, Method=${res_method}, Reason=${ANNOTATION_REASON}"
+                return 1; # Indicate failure for script control flow if needed
+              elif [[ "$res_status" == "SKIPPED" ]]; then
+                echo "::warning title=Test Skipped [$INDEX/$TOTAL] ${REPO}::Repo=${REPO}, Status=${res_status}, Method=${res_method}, Reason=${ANNOTATION_REASON}"
+                return 0; # Indicate success/skip
+              else # SUCCESS
+                echo "::notice title=Test Passed [$INDEX/$TOTAL] ${REPO}::Repo=${REPO}, Status=${res_status}, Method=${res_method}, Reason=${ANNOTATION_REASON}"
+                return 0; # Indicate success
+              fi
+            } # Helper END
 
-            run_docker_container() { # Helper function definition START
-              local image_tag="$1"; local container_name="$2"; local host_port="$3"; local p8080=8080; local p6277=6277
-              echo "--> Attempting to start container $container_name ($image_tag) mapping host $host_port"
-              echo "--> Trying internal port $p8080..."; docker run -d --rm --name "$container_name" -p "${host_port}:${p8080}" "$image_tag" &> docker_run.log; RUN_SUCCESS=$?; sleep 5
-              if docker ps --filter "name=$container_name" --filter "status=running" | grep -q "$container_name"; then echo "--> Container running with internal port $p8080."; rm -f docker_run.log; return 0; fi
-              echo "--> Container not running (Exit hint: $RUN_SUCCESS, Log: $(cat docker_run.log || echo N/A)). Trying internal port $p6277..."; rm -f docker_run.log
-              docker stop "$container_name" > /dev/null 2>&1 || true; docker rm "$container_name" > /dev/null 2>&1 || true # Cleanup
-              docker run -d --rm --name "$container_name" -p "${host_port}:${p6277}" "$image_tag" &> docker_run.log; RUN_SUCCESS=$?; sleep 5
-              if docker ps --filter "name=$container_name" --filter "status=running" | grep -q "$container_name"; then echo "--> Container running with internal port $p6277."; rm -f docker_run.log; return 0; fi
-              echo "::error::Failed to start container $container_name on internal ports $p8080 or $p6277 (Exit hint: $RUN_SUCCESS, Log: $(cat docker_run.log || echo N/A))."; rm -f docker_run.log
-              docker stop "$container_name" > /dev/null 2>&1 || true; docker rm "$container_name" > /dev/null 2>&1 || true # Cleanup
-              return 1
-            } # Helper function definition END
 
-            cleanup_docker() { # Helper function definition START
-              local container_name="$1"; echo "--> Cleaning up Docker container $container_name..."
-              timeout 30s docker stop "$container_name" > /dev/null 2>&1 || true; docker rm "$container_name" > /dev/null 2>&1 || true
-            } # Helper function definition END
+            # Helper function to run the inspector test
+            run_inspector_test() { # Helper START
+                local server_cmd="$1"; local test_name="$2"; local test_type="${3:-stdio}"; # Default to stdio
+                echo "--> Testing with Inspector ($test_type): $test_name";
+                local inspector_cmd;
+                local inspector_timeout="180s"; # Timeout for the inspector process itself
+                local tools_list_method="tools/list"
+                local inspect_cmd="npx --yes @modelcontextprotocol/inspector"
+
+                if [[ "$test_type" == "stdio" ]]; then
+                    # For stdio, pass the server command directly to --cli
+                    inspector_cmd=(timeout "$inspector_timeout" "$inspect_cmd" --cli "$server_cmd" --method "$tools_list_method")
+                elif [[ "$test_type" == "sse" ]]; then
+                    # For SSE, the server_cmd is actually the URL
+                    local sse_url="$server_cmd"
+                    inspector_cmd=(timeout "$inspector_timeout" "$inspect_cmd" --sse "$sse_url" --method "$tools_list_method")
+                else
+                    echo "::error::Unknown inspector test type: $test_type"; return 1;
+                fi
+
+                echo "--> Running: ${inspector_cmd[*]}" | sed "s/$GH_MCP_TOKEN/<GH_MCP_TOKEN_REDACTED>/g" # Avoid logging token
+                # Execute the command, capture output and exit code
+                inspector_output=$( "${inspector_cmd[@]}" 2>&1 )
+                local exit_code=$?
+                echo "$inspector_output" # Print output to logs
+
+                if [[ $exit_code -eq 0 ]]; then
+                    echo "--> Inspector test PASSED ($test_name)."
+                    # Pass on success
+                    record_result "SUCCESS" "Inspector test ($test_type) passed." "$test_name"
+                    return 0 # Signal success to calling code
+                elif [[ $exit_code -eq 124 ]]; then # Timeout exit code
+                     echo "::warning::Inspector test TIMED OUT after $inspector_timeout ($test_name). Exit code: $exit_code"
+                     # Treat timeout as failure for reporting, but allow outer function to continue if needed
+                     record_result "FAILURE" "Inspector test ($test_type) timed out after $inspector_timeout." "$test_name"
+                     return 1 # Signal failure
+                else
+                    echo "::warning::Inspector test FAILED ($test_name). Exit code: $exit_code"
+                    # Treat other non-zero exits as failure
+                    record_result "FAILURE" "Inspector test ($test_type) failed (Exit code: $exit_code)." "$test_name"
+                    return 1 # Signal failure
+                fi
+            } # Helper END
+
+
+            # Helper function to run Docker container, trying common ports
+            run_docker_container() { # Helper START
+                local image_tag="$1"; local container_name="$2"; local host_port="$3";
+                local common_ports=(8080 6277 8000 5000 3000) # Common ports to try internally
+                echo "--> Attempting to start container $container_name ($image_tag) mapping HOST:${host_port} to CONTAINER"
+
+                for internal_port in "${common_ports[@]}"; do
+                    echo "--> Trying internal port $internal_port..."
+                    docker run -d --rm --name "$container_name" -p "${host_port}:${internal_port}" "$image_tag" &> docker_run.log
+                    local run_exit_code=$?
+                    sleep 8 # Allow more time for container to potentially start/stabilize
+
+                    if docker ps --filter "name=$container_name" --filter "status=running" | grep -q "$container_name"; then
+                        echo "--> Container '$container_name' is running, mapped HOST:${host_port} -> CONTAINER:${internal_port}."
+                        rm -f docker_run.log
+                        return 0 # Success, container running
+                    else
+                        echo "--> Container '$container_name' failed to start/stay running with internal port $internal_port. Exit hint: $run_exit_code. Log: $(cat docker_run.log || echo N/A)"
+                        rm -f docker_run.log
+                        # Ensure cleanup before next attempt
+                        docker stop "$container_name" > /dev/null 2>&1 || true
+                        docker rm "$container_name" > /dev/null 2>&1 || true
+                    fi
+                done
+
+                echo "::error::Failed to start container '$container_name' on any common internal port (${common_ports[*]})."
+                return 1 # Failure after trying all ports
+            } # Helper END
+
+
+            # Helper function for Docker cleanup
+            cleanup_docker() { # Helper START
+              local container_name="$1";
+              if [[ -z "$container_name" ]]; then return; fi
+              echo "--> Cleaning up Docker container $container_name...";
+              # Use timeout for stop, then force remove
+              timeout 15s docker stop "$container_name" > /dev/null 2>&1
+              docker rm -f "$container_name" > /dev/null 2>&1 || true # Force remove if stop failed/timed out
+              echo "--> Cleanup attempt finished for $container_name."
+            } # Helper END
 
             # --- Start logging & Checkout ---
+            # Redirect stdout/stderr to log file AND console
             exec > >(tee -a "$TEST_LOG") 2> >(tee -a "$TEST_LOG" >&2)
-            echo "--> Checking out $REPO into $CHECKOUT_DIR..."
+
+            echo "--> Checking out $REPO into $CHECKOUT_DIR using HOST_PORT $HOST_PORT"
             rm -rf "$CHECKOUT_DIR"; GIT_CLONE_URL=""
-            if [[ "$REPO" == */* && ! "$REPO" == *.*/* ]]; then GIT_CLONE_URL="https://github.com/${REPO}.git"
-            elif [[ "$REPO" == github.com/* || "$REPO" == gitlab.com/* || "$REPO" == gitea.com/* ]]; then GIT_CLONE_URL="https://${REPO}.git"
-            else echo "::warning:: Assuming GitHub for: ${REPO}."; GIT_CLONE_URL="https://github.com/${REPO}.git"; fi
+            # Handle different repo URL formats
+            if [[ "$REPO" == github.com/* || "$REPO" == gitlab.com/* || "$REPO" == gitea.com/* ]]; then
+              GIT_CLONE_URL="https://${REPO}.git"
+            elif [[ "$REPO" == */* && ! "$REPO" == *.*/* ]]; then # Assume github.com if just owner/repo
+              GIT_CLONE_URL="https://github.com/${REPO}.git"
+            else
+              echo "::warning::Cannot determine Git URL structure for: ${REPO}. Skipping."
+              record_result "SKIPPED" "Unknown repository URL format: $REPO" "None"
+              cd "$GITHUB_WORKSPACE" || exit 1 # Return to base directory
+              return # Exit function early
+            fi
+
             echo "--> Cloning URL: $GIT_CLONE_URL"
-            if ! timeout 300s git clone --depth 1 "$GIT_CLONE_URL" "$CHECKOUT_DIR"; then record_result "SKIPPED" "Checkout failed. URL: $GIT_CLONE_URL" "None"; return; fi
-            if [ ! -d "$CHECKOUT_DIR" ] || [ -z "$(ls -A "$CHECKOUT_DIR")" ]; then record_result "SKIPPED" "Checkout empty. URL: $GIT_CLONE_URL" "None"; return; fi
-            echo "--> Checkout successful."; cd "$CHECKOUT_DIR"
+            if ! timeout 300s git clone --depth 1 "$GIT_CLONE_URL" "$CHECKOUT_DIR"; then
+              record_result "SKIPPED" "Checkout failed. URL: $GIT_CLONE_URL" "None"
+              cd "$GITHUB_WORKSPACE" || exit 1
+              return
+            fi
+            if [ ! -d "$CHECKOUT_DIR" ] || [ -z "$(ls -A "$CHECKOUT_DIR")" ]; then
+              record_result "SKIPPED" "Checkout empty or failed. URL: $GIT_CLONE_URL" "None"
+              cd "$GITHUB_WORKSPACE" || exit 1
+              return
+            fi
+            echo "--> Checkout successful."; cd "$CHECKOUT_DIR" || { echo "::error::Failed to cd into $CHECKOUT_DIR"; exit 1; }
+
 
             # --- Detect and test ---
-            NORMALIZED_REPO_NAME=$(echo "$REPO" | sed -E 's/^(github\.com|gitlab\.com|gitea\.com)\///' | sed 's/\.git$//'); echo "Normalized Repo Name: $NORMALIZED_REPO_NAME"
+            # Normalize repo name for matching known servers
+            NORMALIZED_REPO_NAME=$(echo "$REPO" | sed -E 's/^(github\.com|gitlab\.com|gitea\.com)\///' | sed 's/\.git$//')
+            echo "Normalized Repo Name for matching: $NORMALIZED_REPO_NAME"
+            local DOCKER_CONTAINER_NAME="mcp-server-test-${REPO_SLUG}" # Define here for cleanup
 
-            # P1: Known Servers
-            if [[ "$NORMALIZED_REPO_NAME" == "github/github-mcp-server" ]]; then RUN_METHOD="Docker Image (Official GitHub)"; echo "--> Matched: $RUN_METHOD"; if [ -z "$GH_MCP_TOKEN" ]; then record_result "SKIPPED" "Secret MCP_TESTER_GITHUB_PAT not set" "$RUN_METHOD"; return; fi; SERVER_CMD="docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN=$GH_MCP_TOKEN ghcr.io/github/github-mcp-server"; if run_inspector_test "$SERVER_CMD" "$RUN_METHOD" "stdio"; then return; else record_result "FAILURE" "Inspector test failed" "$RUN_METHOD"; return; fi; fi
-            if [[ "$NORMALIZED_REPO_NAME" == "microsoft/playwright-mcp" ]]; then RUN_METHOD="npx @playwright/mcp"; echo "--> Matched: $RUN_METHOD"; SERVER_CMD="npx --yes @playwright/mcp@latest --headless"; if run_inspector_test "$SERVER_CMD" "$RUN_METHOD" "stdio"; then return; else record_result "FAILURE" "Inspector test failed" "$RUN_METHOD"; return; fi; fi
-            if [[ "$NORMALIZED_REPO_NAME" == "pydantic/pydantic-ai" ]]; then RUN_METHOD="deno run jsr:"; echo "--> Matched: $RUN_METHOD"; (cd "${GITHUB_WORKSPACE}" && deno run -A --node-modules-dir=auto jsr:@pydantic/mcp-run-python warmup) || { record_result "FAILURE" "Deno warmup failed" "$RUN_METHOD"; return; }; SERVER_CMD="deno run -A --node-modules-dir=auto jsr:@pydantic/mcp-run-python stdio"; if run_inspector_test "$SERVER_CMD" "$RUN_METHOD" "stdio"; then return; else record_result "FAILURE" "Inspector test failed" "$RUN_METHOD"; return; fi; fi
+            # Ensure cleanup happens on exit/error within the function
+            trap 'echo "--> Test function exiting..."; cd "$GITHUB_WORKSPACE"; cleanup_docker "$DOCKER_CONTAINER_NAME"; exec >&1 2>&1;' EXIT
 
-            # P2: Docker Compose + Dockerfile Fallback
-            if [[ -f "docker-compose.yml" || -f "compose.yml" ]] && [[ -f "Dockerfile" ]]; then RUN_METHOD="Dockerfile (Compose Fallback)"; echo "--> Found Dockerfile + Compose. Building..."; IMAGE_TAG="mcp-test-image-${REPO_SLUG}"; CONTAINER_NAME="mcp-server-test-${REPO_SLUG}"; if timeout 300s docker build -t "$IMAGE_TAG" .; then if run_docker_container "$IMAGE_TAG" "$CONTAINER_NAME" "$HOST_PORT"; then echo "--> Docker started. Wait 10s..."; sleep 10; TEST_URL="http://localhost:${HOST_PORT}/sse"; if run_inspector_test "$TEST_URL" "$RUN_METHOD" "sse"; then cleanup_docker "$CONTAINER_NAME"; return; fi; record_result "FAILURE" "Inspector SSE test failed ($TEST_URL)" "$RUN_METHOD"; cleanup_docker "$CONTAINER_NAME"; return; else record_result "FAILURE" "Docker run failed" "$RUN_METHOD"; cleanup_docker "$CONTAINER_NAME"; return; fi; else record_result "FAILURE" "Docker build failed" "$RUN_METHOD"; return; fi; fi
-            if [[ -f "docker-compose.yml" || -f "compose.yml" ]] && [[ ! -f "Dockerfile" ]]; then RUN_METHOD="Docker Compose (Detected)"; record_result "SKIPPED" "Compose file found but no Dockerfile fallback. Direct compose test N/A." "$RUN_METHOD"; return; fi
+            # P1: Known Servers (using normalized name)
+            if [[ "$NORMALIZED_REPO_NAME" == "github/github-mcp-server" ]]; then
+                RUN_METHOD="Docker Image (Official GitHub)"
+                echo "--> Matched: $RUN_METHOD"
+                if [ -z "$GH_MCP_TOKEN" ]; then record_result "SKIPPED" "Secret MCP_TESTER_GITHUB_PAT not set" "$RUN_METHOD"; return; fi
+                SERVER_CMD="docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN=$GH_MCP_TOKEN ghcr.io/github/github-mcp-server"
+                # run_inspector_test will call record_result internally
+                if run_inspector_test "$SERVER_CMD" "$RUN_METHOD" "stdio"; then return; fi # Exit if successful
+                # If failed, record_result was already called by run_inspector_test
+                return # Exit function regardless of outcome
+            fi
 
-            # P3: Dockerfile only
-            if [ -f "Dockerfile" ]; then RUN_METHOD="Dockerfile"; echo "--> Found Dockerfile. Building..."; IMAGE_TAG="mcp-test-image-${REPO_SLUG}"; CONTAINER_NAME="mcp-server-test-${REPO_SLUG}"; if timeout 300s docker build -t "$IMAGE_TAG" .; then if run_docker_container "$IMAGE_TAG" "$CONTAINER_NAME" "$HOST_PORT"; then echo "--> Docker started. Wait 10s..."; sleep 10; TEST_URL="http://localhost:${HOST_PORT}/sse"; if run_inspector_test "$TEST_URL" "$RUN_METHOD" "sse"; then cleanup_docker "$CONTAINER_NAME"; return; fi; record_result "FAILURE" "Inspector SSE test failed ($TEST_URL)" "$RUN_METHOD"; cleanup_docker "$CONTAINER_NAME"; return; else record_result "FAILURE" "Docker run failed" "$RUN_METHOD"; cleanup_docker "$CONTAINER_NAME"; return; fi; else record_result "FAILURE" "Docker build failed" "$RUN_METHOD"; return; fi; fi
+            if [[ "$NORMALIZED_REPO_NAME" == "microsoft/playwright-mcp" ]]; then
+                RUN_METHOD="npx @playwright/mcp"
+                echo "--> Matched: $RUN_METHOD"
+                SERVER_CMD="npx --yes @playwright/mcp@latest --headless"
+                if run_inspector_test "$SERVER_CMD" "$RUN_METHOD" "stdio"; then return; fi
+                return
+            fi
+
+            if [[ "$NORMALIZED_REPO_NAME" == "pydantic/pydantic-ai" ]]; then
+                RUN_METHOD="deno run jsr:"
+                echo "--> Matched: $RUN_METHOD"
+                # Run warmup from workspace to avoid polluting checkout dir? Or maybe inside? Let's try workspace.
+                if ! (cd "${GITHUB_WORKSPACE}" && timeout 120s deno run -A --node-modules-dir=auto jsr:@pydantic/mcp-run-python warmup); then
+                    record_result "FAILURE" "Deno warmup failed (jsr:@pydantic/mcp-run-python warmup)" "$RUN_METHOD"
+                    return
+                fi
+                SERVER_CMD="deno run -A --node-modules-dir=auto jsr:@pydantic/mcp-run-python stdio"
+                if run_inspector_test "$SERVER_CMD" "$RUN_METHOD" "stdio"; then return; fi
+                return
+            fi
+
+
+            # P2/P3: Dockerfile (with or without compose) - Unified Logic
+            if [ -f "Dockerfile" ]; then
+                # Decide method name based on compose presence
+                if [[ -f "docker-compose.yml" || -f "compose.yml" ]]; then
+                    RUN_METHOD="Dockerfile (compose present)"
+                    echo "--> Found Dockerfile and docker-compose.yml/compose.yml. Will build Dockerfile directly."
+                else
+                    RUN_METHOD="Dockerfile"
+                    echo "--> Found Dockerfile. Building..."
+                fi
+                IMAGE_TAG="mcp-test-image-${REPO_SLUG}"
+
+                echo "--> Building Docker image '$IMAGE_TAG'..."
+                if timeout 600s docker build -t "$IMAGE_TAG" .; then
+                    echo "--> Docker build successful."
+                    # Try running the container
+                    if run_docker_container "$IMAGE_TAG" "$DOCKER_CONTAINER_NAME" "$HOST_PORT"; then
+                        echo "--> Docker container '$DOCKER_CONTAINER_NAME' started on host port $HOST_PORT. Waiting 15s for stabilization..."
+                        sleep 15
+                        # Test via SSE
+                        TEST_URL="http://localhost:${HOST_PORT}/sse" # Assuming /sse is the standard endpoint
+                        if run_inspector_test "$TEST_URL" "$RUN_METHOD" "sse"; then
+                            # Test passed, cleanup handled by trap
+                            return
+                        fi
+                        # Inspector test failed (SSE) - run_inspector_test already recorded failure
+                        return # Exit function after failure
+                    else
+                        # run_docker_container failed
+                        record_result "FAILURE" "Docker run failed for image $IMAGE_TAG" "$RUN_METHOD"
+                        return # Exit function after failure
+                    fi
+                else
+                    record_result "FAILURE" "Docker build failed" "$RUN_METHOD"
+                    return # Exit function after failure
+                fi
+            elif [[ -f "docker-compose.yml" || -f "compose.yml" ]]; then
+                # If compose exists BUT Dockerfile does NOT
+                RUN_METHOD="Docker Compose (No Dockerfile)"
+                record_result "SKIPPED" "Compose file found but no Dockerfile. Direct compose testing not implemented." "$RUN_METHOD"
+                return # Exit function
+            fi
+
 
             # P4: Node.js
-            if [ -f "package.json" ]; then RUN_METHOD="Node.js"; echo "--> Found package.json. Installing..."; if [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ]; then echo "--> npm ci"; timeout 300s npm ci --no-audit --fund=false --loglevel=error || { record_result "FAILURE" "npm ci failed" "$RUN_METHOD"; return; }; else echo "--> npm install"; timeout 300s npm install --no-audit --fund=false --loglevel=error || { record_result "FAILURE" "npm install failed" "$RUN_METHOD"; return; }; fi; SERVER_CMD=""; if node -e "process.exit(require('./package.json').scripts?.start ? 0 : 1)" 2>/dev/null; then echo "--> Trying npm start..."; SERVER_CMD="npm start"; if run_inspector_test "$SERVER_CMD" "$RUN_METHOD (npm start)" "stdio"; then return; fi; fi; MAIN_FILE=$(node -p "try{require('./package.json').main||'index.js'}catch(e){'index.js'}" 2>/dev/null); if [ -f "$MAIN_FILE" ]; then echo "--> Trying node ."; SERVER_CMD="node ."; if run_inspector_test "$SERVER_CMD" "$RUN_METHOD (node .)" "stdio"; then return; fi; fi; IS_HTTP=$(node -e "try{const p=require('./package.json');process.exit((p.scripts?.start&&!p.scripts.start.includes('stdio'))||(p.main&&!p.main.includes('stdio'))?0:1)}catch(e){process.exit(1)}" 2>/dev/null); if [[ $? -eq 0 ]]; then record_result "SKIPPED" "stdio failed; package.json suggests non-stdio." "$RUN_METHOD"; return; else record_result "FAILURE" "stdio failed." "$RUN_METHOD"; return; fi; fi
+            if [ -f "package.json" ]; then
+                RUN_METHOD="Node.js"
+                echo "--> Found package.json. Setting up environment..."
+                # Prefer npm ci if lock file exists
+                INSTALL_SUCCESS=false
+                if [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ]; then
+                    echo "--> Using npm ci"
+                    if timeout 300s npm ci --no-audit --fund=false --loglevel=error; then INSTALL_SUCCESS=true; fi
+                else
+                    echo "--> Using npm install"
+                    if timeout 300s npm install --no-audit --fund=false --loglevel=error; then INSTALL_SUCCESS=true; fi
+                fi
+
+                if ! $INSTALL_SUCCESS; then
+                    record_result "FAILURE" "npm install/ci failed" "$RUN_METHOD"
+                    return
+                fi
+                echo "--> Node dependencies installed."
+
+                # Try common start methods
+                SERVER_CMD=""
+                # Check if 'start' script exists
+                if node -e "process.exit(require('./package.json').scripts?.start ? 0 : 1)" 2>/dev/null; then
+                    echo "--> Trying 'npm start'..."
+                    SERVER_CMD="npm start"
+                    if run_inspector_test "$SERVER_CMD" "$RUN_METHOD (npm start)" "stdio"; then return; fi
+                    # Reset SERVER_CMD if it failed
+                    SERVER_CMD=""
+                fi
+
+                # Check 'main' field or default to index.js
+                MAIN_FILE=$(node -p "try{require('./package.json').main||'index.js'}catch(e){'index.js'}" 2>/dev/null)
+                if [ -f "$MAIN_FILE" ]; then
+                    echo "--> Trying 'node $MAIN_FILE' (from main field)..."
+                    SERVER_CMD="node $MAIN_FILE"
+                     if run_inspector_test "$SERVER_CMD" "$RUN_METHOD (node main)" "stdio"; then return; fi
+                     SERVER_CMD=""
+                elif [ -f "index.js" ] && [[ "$MAIN_FILE" != "index.js" ]]; then # Try index.js if main failed or wasn't index.js
+                     echo "--> Trying 'node index.js' (default)..."
+                     SERVER_CMD="node index.js"
+                     if run_inspector_test "$SERVER_CMD" "$RUN_METHOD (node index.js)" "stdio"; then return; fi
+                     SERVER_CMD=""
+                fi
+
+                 # If all stdio tests failed, record final failure for Node.js
+                 record_result "FAILURE" "All Node.js stdio test methods failed." "$RUN_METHOD"
+                 return
+            fi
+
 
             # P5: Python
-            if [ -f "pyproject.toml" ] || [ -f "requirements.txt" ]; then RUN_METHOD="Python"; echo "--> Found Python project. Setting up venv..."; uv venv .venv --seed || { record_result "FAILURE" "uv venv failed" "$RUN_METHOD"; return; }; source .venv/bin/activate || { record_result "FAILURE" "venv activation failed" "$RUN_METHOD"; return; }; echo "--> Installing Python deps..."; INSTALL_CMD=""; if [ -f "pyproject.toml" ] && grep -qE '^\[project\]' pyproject.toml; then INSTALL_CMD="uv pip install '.[all]' || uv pip install '.'"; elif [ -f "requirements.lock" ] || [ -f "uv.lock" ]; then INSTALL_CMD="uv sync --locked || uv sync"; elif [ -f "requirements.txt" ]; then INSTALL_CMD="uv pip install -r requirements.txt"; else INSTALL_CMD="uv sync"; fi; timeout 360s bash -c "$INSTALL_CMD" || { record_result "FAILURE" "Python dep install failed ($INSTALL_CMD)" "$RUN_METHOD"; deactivate 2>/dev/null; return; }; PYTHON_EXEC="python"; SERVER_CMD=""; if [ -f "main.py" ]; then echo "--> Trying python main.py"; SERVER_CMD="$PYTHON_EXEC main.py"; if run_inspector_test "$SERVER_CMD" "$RUN_METHOD (main.py)" "stdio"; then deactivate 2>/dev/null; return; fi; fi; if [ -f "app.py" ]; then echo "--> Trying python app.py"; SERVER_CMD="$PYTHON_EXEC app.py"; if run_inspector_test "$SERVER_CMD" "$RUN_METHOD (app.py)" "stdio"; then deactivate 2>/dev/null; return; fi; fi; if [ -f "server.py" ]; then echo "--> Trying python server.py"; SERVER_CMD="$PYTHON_EXEC server.py"; if run_inspector_test "$SERVER_CMD" "$RUN_METHOD (server.py)" "stdio"; then deactivate 2>/dev/null; return; fi; fi; PY_MOD_NAME=$(basename "$PWD" | sed 's/-/_/g'); if [ -d "$PY_MODULE_NAME" ] || [ -f "${PY_MODULE_NAME}.py" ]; then echo "--> Trying python -m $PY_MODULE_NAME"; SERVER_CMD="$PYTHON_EXEC -m $PY_MODULE_NAME"; if run_inspector_test "$SERVER_CMD" "$RUN_METHOD (-m module)" "stdio"; then deactivate 2>/dev/null; return; fi; fi; record_result "FAILURE" "Python stdio tests failed." "$RUN_METHOD"; deactivate 2>/dev/null; return; fi
+            if [ -f "pyproject.toml" ] || [ -f "requirements.txt" ]; then
+                RUN_METHOD="Python"
+                echo "--> Found Python project files. Setting up using uv..."
+                # Create venv
+                if ! uv venv .venv --seed; then record_result "FAILURE" "uv venv creation failed" "$RUN_METHOD"; return; fi
+                # Activate venv - need to use 'source' which requires bash context
+                if ! source .venv/bin/activate; then record_result "FAILURE" "Python venv activation failed" "$RUN_METHOD"; return; fi
+                echo "--> Python venv activated."
+
+                # Install dependencies using uv
+                INSTALL_CMD=""
+                INSTALL_DESC=""
+                if [ -f "pyproject.toml" ] && grep -qE '^\s*\[project\]' pyproject.toml; then
+                    INSTALL_CMD="uv pip install '.[all]' || uv pip install '.'" # Try with extras first
+                    INSTALL_DESC="uv pip install .[all] or ."
+                elif [ -f "requirements.lock" ] || [ -f "uv.lock" ]; then
+                    INSTALL_CMD="uv sync --locked || uv sync" # Try locked first
+                    INSTALL_DESC="uv sync --locked or uv sync"
+                elif [ -f "requirements.txt" ]; then
+                    INSTALL_CMD="uv pip install -r requirements.txt"
+                    INSTALL_DESC="uv pip install -r requirements.txt"
+                else
+                    # Fallback: assume pyproject.toml exists but might not have [project] section standardly
+                    # Or only setup.py exists (less common now)
+                    INSTALL_CMD="uv pip install '.'"
+                    INSTALL_DESC="uv pip install ."
+                fi
+
+                echo "--> Installing Python dependencies using: $INSTALL_DESC"
+                # Run install in a subshell to handle potential || logic correctly with timeout
+                if ! timeout 480s bash -c "$INSTALL_CMD"; then
+                    record_result "FAILURE" "Python dependency install failed ($INSTALL_DESC)" "$RUN_METHOD"
+                    deactivate &>/dev/null || true # Attempt deactivate
+                    return
+                fi
+                echo "--> Python dependencies installed."
+
+                # Try common execution methods (stdio)
+                PYTHON_EXEC="python" # Could also be python3
+                SERVER_CMD=""
+                TEST_PASSED=false
+
+                declare -a python_files=("main.py" "app.py" "server.py")
+                for py_file in "${python_files[@]}"; do
+                    if [ -f "$py_file" ]; then
+                        echo "--> Trying '$PYTHON_EXEC $py_file'..."
+                        SERVER_CMD="$PYTHON_EXEC $py_file"
+                        if run_inspector_test "$SERVER_CMD" "$RUN_METHOD ($py_file)" "stdio"; then TEST_PASSED=true; break; fi
+                    fi
+                done
+
+                # Try running as module if no file worked
+                if ! $TEST_PASSED; then
+                    # Infer module name from directory name (replace hyphens with underscores)
+                    PY_MODULE_NAME=$(basename "$PWD" | sed 's/-/_/g')
+                    if [ -d "$PY_MODULE_NAME" ] || [ -f "${PY_MODULE_NAME}.py" ]; then
+                        echo "--> Trying '$PYTHON_EXEC -m $PY_MODULE_NAME'..."
+                        SERVER_CMD="$PYTHON_EXEC -m $PY_MODULE_NAME"
+                        if run_inspector_test "$SERVER_CMD" "$RUN_METHOD (-m module)" "stdio"; then TEST_PASSED=true; fi
+                    fi
+                fi
+
+                deactivate &>/dev/null || true # Deactivate venv
+                echo "--> Python venv deactivated."
+
+                if $TEST_PASSED; then return; fi # Exit if any test passed
+
+                # If all Python tests failed
+                record_result "FAILURE" "All Python stdio test methods failed." "$RUN_METHOD"
+                return
+            fi
+
 
             # P6: Go
-            if [ -f "go.mod" ]; then RUN_METHOD="Go"; echo "--> Found go.mod. Building..."; BINARY_NAME="./mcp-server-go-binary"; timeout 300s go build -o "$BINARY_NAME" . || { record_result "FAILURE" "go build failed" "$RUN_METHOD"; return; }; [ -f "$BINARY_NAME" ] || { record_result "FAILURE" "go build produced no binary" "$RUN_METHOD"; return; }; chmod +x "$BINARY_NAME"; echo "--> Trying $BINARY_NAME stdio"; SERVER_CMD="$BINARY_NAME stdio"; if run_inspector_test "$SERVER_CMD" "$RUN_METHOD (stdio arg)" "stdio"; then return; fi; echo "--> Trying $BINARY_NAME"; SERVER_CMD="$BINARY_NAME"; if run_inspector_test "$SERVER_CMD" "$RUN_METHOD (no args)" "stdio"; then return; fi; record_result "FAILURE" "Go stdio tests failed." "$RUN_METHOD"; return; fi
+            if [ -f "go.mod" ]; then
+                RUN_METHOD="Go"
+                echo "--> Found go.mod. Building executable..."
+                # Use a predictable binary name within the checkout dir
+                BINARY_NAME="./mcp-server-go-binary"
+                rm -f "$BINARY_NAME" # Remove any previous attempt
 
-            # Fallback: No Method Found
-            RUN_METHOD="None"; record_result "SKIPPED" "No method known/tested successfully." "$RUN_METHOD";
+                if ! timeout 300s go build -o "$BINARY_NAME" .; then
+                    record_result "FAILURE" "go build failed" "$RUN_METHOD"
+                    return
+                fi
+
+                if [ ! -f "$BINARY_NAME" ]; then
+                     record_result "FAILURE" "go build command succeeded but produced no binary named '$BINARY_NAME'" "$RUN_METHOD"
+                     return
+                fi
+                chmod +x "$BINARY_NAME"
+                echo "--> Go build successful: $BINARY_NAME"
+
+                # Try running with "stdio" argument first
+                echo "--> Trying '$BINARY_NAME stdio'..."
+                SERVER_CMD="$BINARY_NAME stdio"
+                if run_inspector_test "$SERVER_CMD" "$RUN_METHOD (stdio arg)" "stdio"; then return; fi
+
+                 # Try running with no arguments
+                echo "--> Trying '$BINARY_NAME' (no args)..."
+                SERVER_CMD="$BINARY_NAME"
+                if run_inspector_test "$SERVER_CMD" "$RUN_METHOD (no args)" "stdio"; then return; fi
+
+                # If both Go tests failed
+                record_result "FAILURE" "All Go stdio test methods failed." "$RUN_METHOD"
+                return
+            fi
+
+
+            # Fallback: No recognizable method found or tested successfully
+            record_result "SKIPPED" "No supported build/run method (Dockerfile, package.json, pyproject.toml/requirements.txt, go.mod) found or tested successfully." "None"
+
+            # Trap will handle cleanup and cd back
           } # === End of test_server function ===
+
 
           # ========================================================
           # === Main Execution Logic (Parallel vs Sequential) ===
@@ -370,26 +667,34 @@ jobs:
             echo "--- Parallel Mode: Testing single server ---"
             if [[ -z "$REPO_TO_TEST" || "$REPO_TO_TEST" == "sequential_run" ]]; then
                echo "::warning:: Parallel mode: REPO_TO_TEST ('${REPO_TO_TEST}') empty/dummy. Skipping job."
-               jq -nc --arg repo "skipped_parallel_${{ strategy.job-index }}" --arg status "SKIPPED" --arg reason "No repo assigned" \
-                  '{repo: $repo, status: $status, reason: $reason, method: "None", duration: 0}' > "test_results/skipped_${{ strategy.job-index }}.json"
+               # Create a skipped result JSON
+               jq -nc --arg repo "skipped_parallel_${{ strategy.job-index }}" --arg status "SKIPPED" --arg reason "No repo assigned to parallel job" \
+                  '{repo: $repo, status: $status, reason: $reason, method: "None", duration: 0}' > "test_results/skipped_parallel_${{ strategy.job-index }}.json"
             else
-               test_server "$REPO_TO_TEST" 1 1 # Index 1 of 1 for this job
+               # Call test_server for the single repo assigned by the matrix
+               # Pass job index as '1' since it's the only one in this job, total '1'
+               test_server "$REPO_TO_TEST" 1 1
             fi
           else
             echo "--- Sequential Mode: Testing all servers from repo_list.txt ---"
             REPO_LIST_FILE="repo_list.txt"
             if [ ! -f "$REPO_LIST_FILE" ]; then echo "::error::Server list ($REPO_LIST_FILE) not found!"; exit 1; fi
-            TOTAL_SERVERS=$(cat "$REPO_LIST_FILE" | wc -l)
-            if [[ "$TOTAL_SERVERS" -eq 0 ]]; then echo "::warning:: Server list empty."; exit 0; fi
+            # Read file into an array to handle potential empty lines better and get accurate count
+            mapfile -t repo_array < <(grep -v '^[[:space:]]*$' "$REPO_LIST_FILE") # Read non-empty lines into array
+            TOTAL_SERVERS=${#repo_array[@]}
+
+            if [[ "$TOTAL_SERVERS" -eq 0 ]]; then echo "::warning:: Server list ($REPO_LIST_FILE) is empty or contains only whitespace."; exit 0; fi
+            echo "Found $TOTAL_SERVERS servers to test sequentially."
+
             CURRENT_INDEX=0
-            while IFS= read -r repo_from_file || [ -n "$repo_from_file" ]; do
+            for repo_from_file in "${repo_array[@]}"; do
               CURRENT_INDEX=$((CURRENT_INDEX + 1))
-              # Run test_server in a way that allows loop to continue if it fails
-              # Capture the return code of record_result (0=success/skip, 1=fail)
+              # Run test_server for the current repo
+              # The function now handles its own cleanup and cd back via trap
               test_server "$repo_from_file" "$CURRENT_INDEX" "$TOTAL_SERVERS"
-              # Return to workspace dir to ensure clean state for next checkout
-              cd "$GITHUB_WORKSPACE" || { echo "::error::Failed to cd back to GITHUB_WORKSPACE"; exit 1; }
-            done < "$REPO_LIST_FILE"
+              # Brief pause between tests? Optional.
+              # sleep 2
+            done
             echo "--- Sequential testing complete ---"
           fi
           echo "Test script finished execution."
@@ -397,33 +702,33 @@ jobs:
 
       # Upload all individual test results from this job instance
       - name: Upload Test Results
-        if: always() # Always run
+        if: always() # Always run to capture logs/results even on failure
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-${{ strategy.job-index || 'sequential' }} # Unique name
+          name: test-results-${{ strategy.job-index || 'sequential' }} # Unique name per job
           path: test_results/ # Upload the whole directory
-          if-no-files-found: ignore
+          if-no-files-found: ignore # Don't fail if a job skipped all tests
 
   # ==============================================================
-  # Job 3: Combine Results and Summarize (Optional)
+  # Job 3: Combine Results and Summarize
   # ==============================================================
   summarize-results:
     name: Summarize Test Results
     needs: test-servers # Run after all test jobs complete
     runs-on: ubuntu-latest
-    # Run if the test jobs completed (success or failure), not if cancelled
-    if: always() && (needs.test-servers.result == 'success' || needs.test-servers.result == 'failure')
+    # Run if the workflow wasn't cancelled, regardless of test job success/failure
+    if: always() && needs.test-servers.result != 'cancelled'
 
     steps:
-      - name: Download All Test Results
+      - name: Download All Test Results Artifacts
         uses: actions/download-artifact@v4
         with:
-          path: all-test-results # Download all artifacts
-          pattern: test-results-* # Match artifacts
-          merge-multiple: true # Merge into one directory
+          path: all-test-results # Download all artifacts into this directory
+          pattern: test-results-* # Match artifacts from all test jobs
+          merge-multiple: true # Merge into the single 'all-test-results' directory
 
       - name: Generate Summary Report
-        id: summary # Give step an ID
+        id: summary # Give step an ID to reference outputs
         shell: bash -eo pipefail {0}
         run: |
           echo "Generating summary report..."
@@ -434,71 +739,113 @@ jobs:
           # Check if results directory exists and has JSON files
           if [ ! -d "$RESULTS_DIR" ] || ! find "$RESULTS_DIR" -name '*.json' -print -quit | grep -q .; then
             echo "No test result JSON files found in $RESULTS_DIR."
-            echo "# Test Summary" > $SUMMARY_FILE; echo "\nNo test results found." >> $SUMMARY_FILE
-            echo "[]" > $JSON_SUMMARY_FILE; echo "failure_count=0" >> $GITHUB_OUTPUT
+            echo "# Test Summary" > $SUMMARY_FILE
+            echo "\nNo test results were found to summarize." >> $SUMMARY_FILE
+            echo "[]" > $JSON_SUMMARY_FILE # Create empty JSON array
+            echo "failure_count=0" >> $GITHUB_OUTPUT
+            echo "summary_status=No Results" >> $GITHUB_OUTPUT
+            cat $SUMMARY_FILE >> $GITHUB_STEP_SUMMARY # Add to GitHub job summary page
             exit 0
           fi
 
-          # Combine all JSON results into a single flat array
-          find "$RESULTS_DIR" -name '*.json' -print0 | xargs -0 jq -s 'flatten | map(select(. != null))' > "$JSON_SUMMARY_FILE" # Flatten and remove nulls
+          # Combine all JSON results into a single flat array using jq
+          # -s slurps all files into one array, flatten merges sub-arrays (if any), map(select(. != null)) removes null entries
+          if ! find "$RESULTS_DIR" -name '*.json' -print0 | xargs -0 jq -s 'flatten | map(select(. != null))' > "$JSON_SUMMARY_FILE"; then
+             echo "::error::Failed to combine JSON results using jq."
+             echo "# Test Summary" > $SUMMARY_FILE
+             echo "\nError combining test results." >> $SUMMARY_FILE
+             echo "[]" > $JSON_SUMMARY_FILE
+             echo "failure_count=1" >> $GITHUB_OUTPUT # Indicate failure
+             echo "summary_status=Error" >> $GITHUB_OUTPUT
+             cat $SUMMARY_FILE >> $GITHUB_STEP_SUMMARY
+             exit 1 # Fail the step
+          fi
 
-          # Check if combined file is empty or just '[]'
+          # Check if combined file is empty or just '[]' after potential errors/nulls
           if [ ! -s "$JSON_SUMMARY_FILE" ] || [ "$(jq 'length' "$JSON_SUMMARY_FILE")" -eq 0 ]; then
-             echo "Combined results file is empty. No results to summarize."
-             echo "# Test Summary" > $SUMMARY_FILE; echo "\nNo valid test results found." >> $SUMMARY_FILE
-             echo "[]" > "$JSON_SUMMARY_FILE"; echo "failure_count=0" >> $GITHUB_OUTPUT
+             echo "Combined results file is empty or contains no valid JSON objects."
+             echo "# Test Summary" > $SUMMARY_FILE
+             echo "\nNo valid test results found after combining files." >> $SUMMARY_FILE
+             echo "[]" > "$JSON_SUMMARY_FILE"
+             echo "failure_count=0" >> $GITHUB_OUTPUT
+             echo "summary_status=No Valid Results" >> $GITHUB_OUTPUT
+             cat $SUMMARY_FILE >> $GITHUB_STEP_SUMMARY
              exit 0
           fi
 
-          # Generate counts
+          # Generate counts using jq
           SUCCESS_COUNT=$(jq '[.[] | select(.status=="SUCCESS")] | length' "$JSON_SUMMARY_FILE")
           FAILURE_COUNT=$(jq '[.[] | select(.status=="FAILURE")] | length' "$JSON_SUMMARY_FILE")
           SKIPPED_COUNT=$(jq '[.[] | select(.status=="SKIPPED")] | length' "$JSON_SUMMARY_FILE")
-          TOTAL_COUNT=$(jq 'length' "$JSON_SUMMARY_FILE")
+          TOTAL_COUNT=$(jq 'length' "$JSON_SUMMARY_FILE") # Total valid results processed
 
           echo "Summary Counts: Total=$TOTAL_COUNT, Success=$SUCCESS_COUNT, Failure=$FAILURE_COUNT, Skipped=$SKIPPED_COUNT"
-          echo "failure_count=$FAILURE_COUNT" >> $GITHUB_OUTPUT
+          echo "failure_count=$FAILURE_COUNT" >> $GITHUB_OUTPUT # Output failure count for workflow status check
+
+          # Determine overall status for summary
+          OVERALL_STATUS="Success"
+          if [[ "$FAILURE_COUNT" -gt 0 ]]; then OVERALL_STATUS="Failure"; fi
+          echo "summary_status=$OVERALL_STATUS" >> $GITHUB_OUTPUT
 
           # Create Markdown Summary
           echo "# Test Summary" > $SUMMARY_FILE
-          echo "\n**Overall Status:**" >> $SUMMARY_FILE
-          printf -- "- **Total Processed:** %s\n" "$TOTAL_COUNT" >> $SUMMARY_FILE
+          echo "\n**Overall Status: $OVERALL_STATUS**" >> $SUMMARY_FILE
+          printf -- "- **Total Results Processed:** %s\n" "$TOTAL_COUNT" >> $SUMMARY_FILE
           printf -- "- ✅ **Success:** %s\n" "$SUCCESS_COUNT" >> $SUMMARY_FILE
           printf -- "- ❌ **Failure:** %s\n" "$FAILURE_COUNT" >> $SUMMARY_FILE
           printf -- "- ⚠️ **Skipped:** %s\n" "$SKIPPED_COUNT" >> $SUMMARY_FILE
 
-          # List Failures
+          # List Failures (if any)
           echo "\n## Failures ($FAILURE_COUNT)" >> $SUMMARY_FILE
-          if [ "$FAILURE_COUNT" -gt 0 ]; then jq -r '.[] | select(.status=="FAILURE") | "- `\(.repo)` (\(.method // "N/A")): \(.reason // "N/A")"' "$JSON_SUMMARY_FILE" >> $SUMMARY_FILE; else echo "_None_" >> $SUMMARY_FILE; fi
+          if [ "$FAILURE_COUNT" -gt 0 ]; then
+            # Use jq to format failures nicely for Markdown table or list
+             echo "| Repository | Method | Reason | Duration |" >> $SUMMARY_FILE
+             echo "|------------|--------|--------|----------|" >> $SUMMARY_FILE
+             jq -r '.[] | select(.status=="FAILURE") | "| `\(.repo)` | \(.method // "N/A") | \(.reason // "N/A" | gsub("\\|"; "\\\\|")) | \(.duration // "N/A")s |"' "$JSON_SUMMARY_FILE" >> $SUMMARY_FILE
+          else
+            echo "_None_" >> $SUMMARY_FILE
+          fi
 
-          # List Skipped
+          # List Skipped (if any)
           echo "\n## Skipped ($SKIPPED_COUNT)" >> $SUMMARY_FILE
-          if [ "$SKIPPED_COUNT" -gt 0 ]; then jq -r '.[] | select(.status=="SKIPPED") | "- `\(.repo)` (\(.method // "N/A")): \(.reason // "N/A")"' "$JSON_SUMMARY_FILE" >> $SUMMARY_FILE; else echo "_None_" >> $SUMMARY_FILE; fi
+          if [ "$SKIPPED_COUNT" -gt 0 ]; then
+            # Use jq to format skipped nicely for Markdown table or list
+             echo "| Repository | Method | Reason | Duration |" >> $SUMMARY_FILE
+             echo "|------------|--------|--------|----------|" >> $SUMMARY_FILE
+             jq -r '.[] | select(.status=="SKIPPED") | "| `\(.repo)` | \(.method // "N/A") | \(.reason // "N/A" | gsub("\\|"; "\\\\|")) | \(.duration // "N/A")s |"' "$JSON_SUMMARY_FILE" >> $SUMMARY_FILE
+          else
+            echo "_None_" >> $SUMMARY_FILE
+          fi
 
           echo "\nSummary report generated: $SUMMARY_FILE"
           echo "Full JSON summary: $JSON_SUMMARY_FILE"
 
-          # Add summary to GitHub step summary page
+          # Add summary to GitHub step summary page for easy viewing in the Actions UI
           cat $SUMMARY_FILE >> $GITHUB_STEP_SUMMARY
 
-      - name: Upload Summary Report
-        if: always() # Always upload
+      - name: Upload Summary Report Artifacts
+        if: always() # Always upload the generated summary files
         uses: actions/upload-artifact@v4
         with:
           name: test-summary-report
           path: |
             test_summary.md
             test_summary.json
-          if-no-files-found: ignore
+          if-no-files-found: ignore # Don't fail if files weren't created due to earlier errors
 
-      # Final step to explicitly fail the workflow if failures occurred
+      # Final step to explicitly fail the workflow run if failures occurred during tests
       - name: Check for Failures in Summary
-        if: always() # Ensure check runs
+        if: always() # Ensure this check runs even if previous steps had warnings/errors
         run: |
-          # Check the failure count output from the previous step
-          if [[ "${{ steps.summary.outputs.failure_count }}" -gt 0 ]]; then
-            echo "::error::Detected ${{ steps.summary.outputs.failure_count }} test failure(s) in the summary."
-            exit 1 # Fail the workflow
+          # Check the failure count output from the summary step
+          FAILURE_COUNT="${{ steps.summary.outputs.failure_count }}"
+          echo "Checking summary failure count: $FAILURE_COUNT"
+          if [[ "$FAILURE_COUNT" -gt 0 ]]; then
+            echo "::error::Detected $FAILURE_COUNT test failure(s) in the summary. Failing workflow."
+            exit 1 # Explicitly fail the workflow run
+          elif [[ "${{ steps.summary.outputs.summary_status }}" == "Error" ]]; then
+            echo "::error::Summary generation encountered an error. Failing workflow."
+            exit 1 # Fail if summary couldn't be generated properly
           else
-            echo "No failures detected in the summary report."
+            echo "No failures detected in the summary report or summary generation succeeded."
           fi
