@@ -1,31 +1,396 @@
-      # Step 1: Setup essential prerequisites ONCE for the entire job
+---
+name: MCP Server Awesome List Tests (Synchronous)
+on:
+  workflow_dispatch: null
+  schedule:
+    - cron: 0 5 * * 1
+jobs:
+  test-all-servers:
+    name: Test All MCP Servers Sequentially
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
       - name: Setup Prerequisites (Node, uv, Go, Deno)
-        run: |
+        run: >
           echo "Setting up Node.js, uv, Go, Deno..."
-          # CORRECTED: Removed 'timeout' from apt-get install
+
+          # Ensure core utils 'timeout' command is usually present, remove from install list
+
           sudo apt-get update && sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg git
+
           # Node.js v20 (needed for mcp-inspector and some servers)
+
           curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+
           sudo apt-get install -y nodejs
+
           echo "Node Version: $(node --version)"
+
           echo "NPM Version: $(npm --version)"
+
           # uv (for Python dependency management)
+
           curl -LsSf https://astral.sh/uv/install.sh | sh
+
           export PATH="$HOME/.cargo/bin:$PATH" # Add uv to PATH for this step and subsequent ones
+
           echo "uv Version: $(uv --version)"
+
           # Go (for Go-based servers)
+
           sudo add-apt-repository ppa:longsleep/golang-backports -y
+
           sudo apt-get update
+
           sudo apt-get install -y golang-go
+
           echo "Go Version: $(go version)"
+
           # Deno (for Deno-based servers like pydantic/mcp-run-python)
+
           curl -fsSL https://deno.land/install.sh | sh
+
           export DENO_INSTALL="$HOME/.deno"
+
           export PATH="$DENO_INSTALL/bin:$PATH" # Add deno to PATH
+
           echo "Deno Version: $(deno --version)"
+
           # Verify Docker client (Docker daemon runs on GitHub runners)
+
           docker --version
+
           # Verify timeout command exists (should be part of coreutils)
+
           command -v timeout
-        # Make exports available to subsequent steps
         shell: bash -eo pipefail {0}
+      - name: Fetch and Parse Server List
+        id: fetch
+        run: >
+          echo "Checking out fork to get server list..."
+
+          git clone --depth 1 https://github.com/Acid-base/awesome-mcp-servers.git awesome-list-fork
+
+          cd awesome-list-fork
+
+
+          echo "Parsing README.md..."
+
+          # Use awk/grep/sed/sort as before, output to a file
+
+          awk '/^## Server Implementations/{flag=1; next} /^## Frameworks/{flag=0} flag' README.md | \
+            grep -oE 'https?:\/\/(github\.com|gitlab\.com|gitea\.com)\/[^/]+\/[^)/ ]+' | \
+            sed -E 's/https?:\/\/(github\.com|gitlab\.com|gitea\.com)\///' | \
+            sort -u > ../repo_list.txt
+
+          REPO_COUNT=$(cat ../repo_list.txt | wc -l)
+
+          echo "Found $REPO_COUNT potential servers."
+
+          echo "count=$REPO_COUNT" >> $GITHUB_OUTPUT
+
+          cd ..
+
+          # Optional: Keep the list repo checkout if needed for metadata later
+
+          # rm -rf awesome-list-fork # Clean up checkout of list repo
+      - name: Test Servers Sequentially
+        env:
+          GH_MCP_TOKEN: ${{ secrets.MCP_TESTER_GITHUB_PAT }}
+          PATH: $HOME/.cargo/bin:$HOME/.deno/bin:${PATH}
+        run: >
+          REPO_LIST_FILE="repo_list.txt"
+
+          if [ ! -f "$REPO_LIST_FILE" ]; then
+              echo "::error::Server list file ($REPO_LIST_FILE) not found!"
+              exit 1
+          fi
+
+
+          REPO_COUNT=${{ steps.fetch.outputs.count }}
+
+          if [ -z "$REPO_COUNT" ] || [ "$REPO_COUNT" -eq 0 ]; then
+              echo "::warning::No servers found in the list file. Exiting job."
+              exit 0
+          fi
+
+
+          CURRENT_INDEX=0
+
+          SUCCESS_COUNT=0
+
+          FAILURE_COUNT=0
+
+          SKIPPED_COUNT=0
+
+
+          # Read the list line by line
+
+          while IFS= read -r REPO || [ -n "$REPO" ]; do
+            # Skip empty lines just in case
+            if [ -z "$REPO" ]; then continue; fi
+
+            CURRENT_INDEX=$((CURRENT_INDEX + 1))
+            echo ""
+            echo "======================================================================"
+            echo "Starting Test [$CURRENT_INDEX/$REPO_COUNT]: ${REPO}"
+            echo "======================================================================"
+            echo ""
+
+            # --- Variables for this iteration ---
+            CHECKOUT_DIR="mcp_server_under_test_${CURRENT_INDEX}" # Unique dir per iteration
+            REPO_SLUG=$(echo "$REPO" | tr '/' '_') # Create a safe name for docker containers etc.
+            STATUS="SKIPPED" # Default status for the loop iteration
+            REASON="Test logic did not complete or match a known type." # Default reason
+            RUN_METHOD="None"
+            TEST_START_TIME=$(date +%s)
+
+            # --- A. Checkout specific server repo ---
+            echo "--> Checking out $REPO into $CHECKOUT_DIR..."
+            # Use GITHUB_WORKSPACE as base path for checkouts
+            CHECKOUT_PATH="${GITHUB_WORKSPACE}/${CHECKOUT_DIR}"
+            rm -rf "$CHECKOUT_PATH" # Clean previous checkout just in case
+            # Use timeout for git clone as well
+            timeout 300 git clone --depth 1 "https://github.com/${REPO}.git" "$CHECKOUT_PATH"
+            CHECKOUT_SUCCESS=$?
+
+            if [ $CHECKOUT_SUCCESS -ne 0 ] || [ ! -d "$CHECKOUT_PATH" ] || [ -z "$(ls -A "$CHECKOUT_PATH")" ]; then
+               REASON="Checkout failed or repository empty (exit code $CHECKOUT_SUCCESS)"
+               STATUS="SKIPPED"
+               # Fall through to reporting section below
+            else
+               echo "--> Checkout successful."
+               # --- B. Test Logic (Prioritized) ---
+               # Use a subshell to isolate environment changes and handle errors/cleanup
+               # Capture the output and exit code of the subshell
+               SUBSHELL_OUTPUT=$(
+                 ( # Start subshell
+                   cd "$CHECKOUT_PATH" # Change directory for file checks within subshell
+                   set -e # Exit subshell on first error within this block
+
+                   # Inherit PATH setup from previous step
+                   export PATH="$HOME/.cargo/bin:$HOME/.deno/bin:$PATH"
+
+                   # Initialize subshell status variables
+                   SUB_STATUS="SKIPPED"
+                   SUB_REASON="No applicable test method found or completed."
+                   SUB_RUN_METHOD="None"
+
+                   # Priority 1: Known Specific Servers
+                   if [[ "$REPO" == "github/github-mcp-server" ]]; then
+                     SUB_RUN_METHOD="Docker Image (Official GitHub)"
+                     echo "--> Matched specific: github/github-mcp-server"
+                     if [ -z "$GH_MCP_TOKEN" ]; then
+                       echo "::warning::Required secret MCP_TESTER_GITHUB_PAT not set."; SUB_STATUS="SKIPPED"; SUB_REASON="Required secret MCP_TESTER_GITHUB_PAT not set"; exit 0;
+                     fi
+                     SERVER_CMD="docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN=$GH_MCP_TOKEN ghcr.io/github/github-mcp-server"
+                     echo "--> Testing: npx inspector wrapping docker..."
+                     timeout 120 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && SUB_STATUS="SUCCESS" || SUB_STATUS="FAILURE"
+                     SUB_REASON="Tested via Docker Image (stdio)"
+
+                   elif [[ "$REPO" == "microsoft/playwright-mcp" ]]; then
+                     SUB_RUN_METHOD="npx @playwright/mcp"
+                     echo "--> Matched specific: microsoft/playwright-mcp"
+                     SERVER_CMD="npx --yes @playwright/mcp@latest --headless"
+                     echo "--> Testing: npx inspector wrapping npx..."
+                     timeout 120 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && SUB_STATUS="SUCCESS" || SUB_STATUS="FAILURE"
+                     SUB_REASON="Tested via npx (stdio)"
+
+                   elif [[ "$REPO" == "pydantic/pydantic-ai" ]]; then # Assuming mcp-run-python is within this repo structure
+                     SUB_RUN_METHOD="deno run jsr:"
+                     echo "--> Matched specific: pydantic/mcp-run-python (from pydantic-ai repo)"
+                     echo "--> Running Deno warmup (from repo root)..."
+                     cd .. # Deno needs to run where node_modules cache will be created
+                     deno run -A --node-modules-dir=auto jsr:@pydantic/mcp-run-python warmup || { echo "::error::Deno warmup failed"; exit 1; } # Fail subshell if warmup fails
+                     cd "$CHECKOUT_PATH" # Go back to checkout dir
+                     echo "--> Testing: npx inspector wrapping deno..."
+                     SERVER_CMD="deno run -A --node-modules-dir=auto jsr:@pydantic/mcp-run-python stdio"
+                     timeout 120 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && SUB_STATUS="SUCCESS" || SUB_STATUS="FAILURE"
+                     SUB_REASON="Tested via Deno (stdio)"
+
+                   # Priority 2: Docker Compose (Detect only, test via Dockerfile if present)
+                   elif [ -f "docker-compose.yml" ] || [ -f "compose.yml" ]; then
+                     SUB_RUN_METHOD="Docker Compose (Detected)"
+                     echo "--> Found docker-compose.yml."
+                     if [ -f "Dockerfile" ]; then
+                       echo "--> Attempting Dockerfile test as fallback..."
+                       SUB_RUN_METHOD="Dockerfile (Compose Fallback)"
+                       docker build -t mcp-test-image-${REPO_SLUG} . || { echo "::warning::docker build failed."; SUB_STATUS="SKIPPED"; SUB_REASON="docker build failed"; exit 0; }
+                       HOST_PORT=6277 # Reuse same port sequentially
+                       INTERNAL_PORT=8080
+                       CONTAINER_NAME="mcp-server-test-${REPO_SLUG}"
+                       docker run -d --rm --name ${CONTAINER_NAME} -p ${HOST_PORT}:${INTERNAL_PORT} mcp-test-image-${REPO_SLUG} && sleep 15 || \
+                         { INTERNAL_PORT=6277; docker run -d --rm --name ${CONTAINER_NAME} -p ${HOST_PORT}:${INTERNAL_PORT} mcp-test-image-${REPO_SLUG} && sleep 15; } || \
+                         { echo "::error::Failed to start container via Dockerfile."; exit 1; } # Fail subshell
+                       echo "--> Testing SSE endpoint http://localhost:${HOST_PORT}/sse"
+                       timeout 120 npx --yes @modelcontextprotocol/inspector --cli http://localhost:${HOST_PORT}/sse --method tools/list && SUB_STATUS="SUCCESS" || SUB_STATUS="FAILURE"
+                       SUB_REASON="Tested via Dockerfile build/run (SSE)"
+                       echo "--> Stopping container ${CONTAINER_NAME}..."
+                       set +e; docker stop ${CONTAINER_NAME} > /dev/null 2>&1 || true; set -e # Attempt cleanup, don't fail subshell if stop fails
+                     else
+                       SUB_STATUS="SKIPPED"; SUB_REASON="docker-compose.yml found, but no Dockerfile for fallback and direct compose testing not implemented."
+                     fi
+
+                   # Priority 3: Dockerfile
+                   elif [ -f "Dockerfile" ]; then
+                     SUB_RUN_METHOD="Dockerfile"
+                     echo "--> Found Dockerfile. Building..."
+                     docker build -t mcp-test-image-${REPO_SLUG} . || { echo "::warning::docker build failed."; SUB_STATUS="SKIPPED"; SUB_REASON="docker build failed"; exit 0; }
+                     HOST_PORT=6277
+                     INTERNAL_PORT=8080
+                     CONTAINER_NAME="mcp-server-test-${REPO_SLUG}"
+                     echo "--> Starting container ${CONTAINER_NAME}..."
+                     docker run -d --rm --name ${CONTAINER_NAME} -p ${HOST_PORT}:${INTERNAL_PORT} mcp-test-image-${REPO_SLUG} && sleep 15 || \
+                       { INTERNAL_PORT=6277; docker run -d --rm --name ${CONTAINER_NAME} -p ${HOST_PORT}:${INTERNAL_PORT} mcp-test-image-${REPO_SLUG} && sleep 15; } || \
+                       { echo "::error::Failed to start container via Dockerfile."; exit 1; } # Fail subshell
+                     echo "--> Testing SSE endpoint http://localhost:${HOST_PORT}/sse"
+                     timeout 120 npx --yes @modelcontextprotocol/inspector --cli http://localhost:${HOST_PORT}/sse --method tools/list && SUB_STATUS="SUCCESS" || SUB_STATUS="FAILURE"
+                     SUB_REASON="Tested via Dockerfile build/run (SSE)"
+                     echo "--> Stopping container ${CONTAINER_NAME}..."
+                     set +e; docker stop ${CONTAINER_NAME} > /dev/null 2>&1 || true; set -e
+
+                   # Priority 4: package.json (Node.js)
+                   elif [ -f "package.json" ]; then
+                     SUB_RUN_METHOD="Node.js (package.json)"
+                     echo "--> Found package.json. Running npm install..."
+                     npm install --no-audit --no-fund --loglevel=error --timeout=300000 || { echo "::warning::npm install failed."; SUB_STATUS="SKIPPED"; SUB_REASON="npm install failed"; exit 0; }
+                     SERVER_CMD="node ."
+                     echo "--> Testing: npx inspector wrapping '$SERVER_CMD'"
+                     timeout 120 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && SUB_STATUS="SUCCESS" || \
+                       { SERVER_CMD="npm start"; echo "--> Testing: npx inspector wrapping '$SERVER_CMD'"; timeout 120 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && SUB_STATUS="SUCCESS"; } || \
+                       { echo "::error::Failed standard Node commands."; SUB_STATUS="FAILURE"; SUB_REASON="Failed standard Node commands"; exit 1; } # Fail subshell
+                     SUB_REASON="Tested via Node.js run (stdio)"
+
+                   # Priority 5: pyproject.toml / requirements.txt (Python)
+                   elif [ -f "pyproject.toml" ] || [ -f "requirements.txt" ]; then
+                     SUB_RUN_METHOD="Python (pyproject/requirements)"
+                     echo "--> Found Python project. Setting up environment..."
+                     uv venv .venv --seed || echo "INFO: uv venv command failed (maybe ok)." # Use --seed for python install
+                     source .venv/bin/activate || echo "INFO: venv activation failed (maybe ok)."
+                     echo "--> Running uv sync..."
+                     uv sync --frozen || uv sync || { echo "::warning::uv sync failed."; SUB_STATUS="SKIPPED"; SUB_REASON="uv sync failed"; exit 0; }
+                     SERVER_CMD="python main.py"
+                     echo "--> Testing: npx inspector wrapping '$SERVER_CMD'"
+                     timeout 120 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && SUB_STATUS="SUCCESS" || \
+                       { SERVER_CMD="python app.py"; echo "--> Testing: npx inspector wrapping '$SERVER_CMD'"; timeout 120 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && SUB_STATUS="SUCCESS"; } || \
+                       { SERVER_CMD="python server.py"; echo "--> Testing: npx inspector wrapping '$SERVER_CMD'"; timeout 120 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && SUB_STATUS="SUCCESS"; } || \
+                       { PY_MODULE_NAME=$(basename "$PWD"); SERVER_CMD="python -m $PY_MODULE_NAME"; echo "--> Testing: npx inspector wrapping '$SERVER_CMD'"; timeout 120 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && SUB_STATUS="SUCCESS"; } || \
+                       { echo "::error::Failed standard Python commands."; SUB_STATUS="FAILURE"; SUB_REASON="Failed standard Python commands"; exit 1; } # Fail subshell
+                     SUB_REASON="Tested via Python run (stdio)"
+
+                   # Priority 6: go.mod (Go)
+                   elif [ -f "go.mod" ]; then
+                     SUB_RUN_METHOD="Go (go.mod)"
+                     echo "--> Found go.mod. Running go build..."
+                     go build -o mcp-server-binary . || { echo "::warning::go build failed."; SUB_STATUS="SKIPPED"; SUB_REASON="go build failed"; exit 0; }
+                     SERVER_CMD="./mcp-server-binary stdio"
+                     echo "--> Testing: npx inspector wrapping '$SERVER_CMD'"
+                     timeout 120 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && SUB_STATUS="SUCCESS" || \
+                       { SERVER_CMD="./mcp-server-binary"; echo "--> Testing: npx inspector wrapping '$SERVER_CMD'"; timeout 120 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && SUB_STATUS="SUCCESS"; } || \
+                       { echo "::error::Failed standard Go commands."; SUB_STATUS="FAILURE"; SUB_REASON="Failed standard Go commands"; exit 1; } # Fail subshell
+                     SUB_REASON="Tested via Go build/run (stdio)"
+
+                   # Priority 7: No Method Found
+                   else
+                     SUB_RUN_METHOD="None"
+                     SUB_STATUS="SKIPPED"
+                     SUB_REASON="No specific method known and no standard build/package config found."
+                   fi
+
+                   # If we reach here without error and status isn't failure/skipped, it must be success
+                   if [[ "$SUB_STATUS" != "FAILURE" && "$SUB_STATUS" != "SKIPPED" ]]; then SUB_STATUS="SUCCESS"; fi
+
+                   # Output results from subshell for parent shell to capture
+                   echo "SUB_STATUS=$SUB_STATUS"
+                   echo "SUB_REASON=$SUB_REASON"
+                   echo "SUB_RUN_METHOD=$SUB_RUN_METHOD"
+
+                 ) # End subshell
+               )
+               SUBSHELL_EXIT_CODE=$?
+
+               # Parse output from subshell
+               STATUS=$(echo "$SUBSHELL_OUTPUT" | grep '^SUB_STATUS=' | cut -d= -f2)
+               REASON=$(echo "$SUBSHELL_OUTPUT" | grep '^SUB_REASON=' | cut -d= -f2-) # Use '-f2-' to capture reasons with '='
+               RUN_METHOD=$(echo "$SUBSHELL_OUTPUT" | grep '^SUB_RUN_METHOD=' | cut -d= -f2)
+
+               # Handle unexpected subshell exit if status wasn't already failure
+               if [[ $SUBSHELL_EXIT_CODE -ne 0 && "$STATUS" != "FAILURE" ]]; then
+                 echo "::error::Test logic subshell exited unexpectedly with code $SUBSHELL_EXIT_CODE."
+                 STATUS="FAILURE"
+                 REASON="Test execution failed unexpectedly (Exit code: $SUBSHELL_EXIT_CODE)."
+               elif [[ "$STATUS" == "FAILURE" && $SUBSHELL_EXIT_CODE -ne 0 ]]; then
+                 echo "INFO: Test logic subshell exited non-zero as expected for FAILURE status."
+               fi
+
+               # Ensure default values if parsing failed
+               STATUS=${STATUS:-SKIPPED}
+               REASON=${REASON:-"Subshell output parsing error or logic did not complete."}
+               RUN_METHOD=${RUN_METHOD:-None}
+
+            fi # End of checkout success check
+
+            # --- C. Reporting for this iteration ---
+            TEST_END_TIME=$(date +%s)
+            DURATION=$((TEST_END_TIME - TEST_START_TIME))
+
+            echo "" # Newline for readability
+            echo "--- Test Result [$CURRENT_INDEX/$REPO_COUNT] :: ${REPO} ---"
+            echo "- Run Method Attempted: ${RUN_METHOD}"
+            echo "- Outcome: ${STATUS}"
+            echo "- Details: ${REASON}"
+            echo "- Duration: ${DURATION}s"
+            echo "--------------------------------------------------"
+            echo "" # Newline for readability
+
+            # Increment counters for summary
+            case $STATUS in
+              SUCCESS) SUCCESS_COUNT=$((SUCCESS_COUNT + 1));;
+              FAILURE) FAILURE_COUNT=$((FAILURE_COUNT + 1));;
+              SKIPPED) SKIPPED_COUNT=$((SKIPPED_COUNT + 1));;
+            esac
+
+            # Use annotations for better visibility in the Actions UI
+            if [[ "$STATUS" == "FAILURE" ]]; then
+              echo "::error title=Test Failed for ${REPO}::Repo=${REPO} Status=${STATUS} Reason=${REASON} Method=${RUN_METHOD}"
+            elif [[ "$STATUS" == "SKIPPED" ]]; then
+              echo "::warning title=Test Skipped for ${REPO}::Repo=${REPO} Status=${STATUS} Reason=${REASON} Method=${RUN_METHOD}"
+            else # SUCCESS
+               echo "::notice title=Test Passed for ${REPO}::Repo=${REPO} Status=${STATUS} Reason=${REASON} Method=${RUN_METHOD}"
+            fi
+
+            # --- D. Cleanup for next iteration ---
+            echo "--> Cleaning up checkout directory ${CHECKOUT_PATH}..."
+            rm -rf "$CHECKOUT_PATH"
+            # Optional: Aggressive Docker cleanup (use with caution)
+            # echo "--> Pruning Docker system..."
+            # docker system prune -af --volumes || echo "INFO: Docker prune failed."
+
+            # Brief pause between servers?
+            # sleep 1
+
+          done < "$REPO_LIST_FILE" # Feed the loop from the repo list file
+
+
+          # --- E. Final Summary ---
+
+          echo ""
+
+          echo "======================================================================"
+
+          echo "Finished processing all servers."
+
+          echo "Summary: SUCCESS=$SUCCESS_COUNT | FAILURE=$FAILURE_COUNT | SKIPPED=$SKIPPED_COUNT | TOTAL=$REPO_COUNT"
+
+          echo "======================================================================"
+
+
+          # Optionally fail the entire job if any failures occurred
+
+          # if [ "$FAILURE_COUNT" -gt 0 ]; then
+
+          #   echo "::error::One or more server tests failed!"
+
+          #   exit 1
+
+          # fi
