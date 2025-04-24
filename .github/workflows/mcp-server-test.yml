@@ -4,137 +4,159 @@ on:
   workflow_dispatch:
     inputs:
       parallel_testing:
-        description: 'Enable parallel testing (Matrix Strategy)'
+        description: Enable parallel testing (Matrix Strategy)
         type: boolean
         default: false
       timeout_minutes:
-        description: 'Workflow timeout in minutes (per job)'
+        description: Workflow timeout in minutes (per job)
         type: number
-        default: 180 # Timeout per test job (parallel or sequential)
+        default: 180
       max_servers:
-        description: 'Maximum number of servers to test (0 for all)'
+        description: Maximum number of servers to test (0 for all)
         type: number
         default: 0
   schedule:
-    - cron: '0 5 * * 1' # Monday at 5:00 UTC weekly (Corrected quotes)
-
+    - cron: 0 5 * * 1
 env:
   NODE_VERSION: 20
   GO_VERSION: 1.22.2
-  # Base port for dynamic allocation (offset by matrix job index or sequential index)
   BASE_HOST_PORT: 7000
-
 jobs:
-  # ==============================================================
-  # Job 1: Prepare Server List and Matrix
-  # ==============================================================
   prepare-server-list:
     name: Prepare Server List & Matrix
     runs-on: ubuntu-latest
     outputs:
       repo_count: ${{ steps.fetch.outputs.count }}
-      # Output matrix as JSON string for the next job's strategy
       server_matrix: ${{ steps.fetch.outputs.matrix }}
     steps:
       - name: Fetch and Parse Server List
         id: fetch
         shell: bash -eo pipefail {0}
-        run: |
+        run: >
           echo "Checking out fork to get server list..."
+
           git clone --depth 1 https://github.com/Acid-base/awesome-mcp-servers.git awesome-list-fork
+
           cd awesome-list-fork
 
+
           echo "Parsing README.md..."
+
           # Extract, normalize, unique sort
+
           awk '/^## Server Implementations/{flag=1; next} /^## Frameworks/{flag=0} flag' README.md | \
             grep -oE 'https?:\/\/(github\.com|gitlab\.com|gitea\.com)\/[^/]+\/[^)/ ]+' | \
             sed -E 's/^https?:\/\///' | \
             sed 's/\.git$//' | \
-            sort -u > ../repo_list.txt
+            sort -u > ../repo_list_full.txt # Save full list first
 
-          REPO_COUNT_FULL=$(cat ../repo_list.txt | wc -l)
+          REPO_COUNT_FULL=$(cat ../repo_list_full.txt | wc -l)
+
           echo "Found $REPO_COUNT_FULL potential servers."
 
+
           # Apply max_servers limit if specified via workflow_dispatch
+
           MAX_SERVERS="${{ github.event.inputs.max_servers || 0 }}" # Default to 0 if not specified
+
           if [[ "$MAX_SERVERS" -gt 0 && "$MAX_SERVERS" -lt "$REPO_COUNT_FULL" ]]; then
-            echo "Limiting to first $MAX_SERVERS servers from the list."
-            head -n "$MAX_SERVERS" ../repo_list.txt > ../limited_list.txt
-            mv ../limited_list.txt ../repo_list.txt
+            echo "Limiting to first $MAX_SERVERS servers from the list based on input."
+            head -n "$MAX_SERVERS" ../repo_list_full.txt > ../repo_list.txt
             REPO_COUNT=$(cat ../repo_list.txt | wc -l)
             echo "Testing $REPO_COUNT servers out of $REPO_COUNT_FULL."
           else
+            cp ../repo_list_full.txt ../repo_list.txt # Use the full list
             REPO_COUNT=$REPO_COUNT_FULL
-            echo "Testing all $REPO_COUNT servers."
+            echo "Testing all $REPO_COUNT servers (or subset limited by matrix size)."
           fi
 
-          # Output final count being tested
+
+          # Output the count AFTER max_servers limit (if any)
+
           echo "count=$REPO_COUNT" >> $GITHUB_OUTPUT
 
-          # Create a JSON matrix ONLY if parallel testing is enabled
-          IS_PARALLEL="${{ github.event.inputs.parallel_testing || false }}" # Default to false
+
+          # --- Matrix Generation Logic ---
+
+          IS_PARALLEL="${{ github.event.inputs.parallel_testing || false }}"
+
+          MATRIX_LIMIT=256 # GitHub Actions matrix limit
+
+
           if [[ "$IS_PARALLEL" == "true" ]]; then
-            echo "Creating matrix for parallel testing..."
-            # Create JSON array of objects: [{"repo": "owner/repo"}, ...] suitable for strategy.matrix.include
-            jq -R --slurp 'split("\n") | map(select(length > 0)) | map({"repo": .}) | {include: .}' ../repo_list.txt > ../matrix.json
+            echo "Parallel testing enabled. Initial server count for matrix: $REPO_COUNT"
+            ACTUAL_MATRIX_COUNT=$REPO_COUNT
+            TARGET_LIST_FILE="../repo_list.txt" # Start with the potentially max_servers-limited list
+
+            if [[ "$REPO_COUNT" -gt "$MATRIX_LIMIT" ]]; then
+              echo "::warning::Requested parallel testing for $REPO_COUNT servers, exceeding the GitHub matrix limit of $MATRIX_LIMIT. The parallel matrix will only include the first $MATRIX_LIMIT servers from the list."
+              head -n "$MATRIX_LIMIT" ../repo_list.txt > ../repo_list_capped.txt
+              TARGET_LIST_FILE="../repo_list_capped.txt" # Use the capped list for matrix generation
+              ACTUAL_MATRIX_COUNT=$MATRIX_LIMIT
+              echo "::notice::To test all $REPO_COUNT servers, either run sequentially (parallel_testing: false) or use the 'max_servers' input to test smaller batches in parallel."
+            fi
+
+            echo "Creating matrix for parallel testing using $ACTUAL_MATRIX_COUNT servers..."
+            # Generate matrix from the TARGET_LIST_FILE (either full or capped)
+            jq -R --slurp 'split("\n") | map(select(length > 0)) | map({"repo": .}) | {include: .}' "$TARGET_LIST_FILE" > ../matrix.json
+
             MATRIX_JSON=$(cat ../matrix.json)
             # Ensure the JSON is valid before outputting
             if jq '.' ../matrix.json > /dev/null 2>&1; then
-              # Use YAML multiline string syntax for potentially large JSON output
               echo "matrix<<EOF" >> $GITHUB_OUTPUT
               echo "${MATRIX_JSON}" >> $GITHUB_OUTPUT
               echo "EOF" >> $GITHUB_OUTPUT
-              echo "Generated parallel matrix with ${REPO_COUNT} entries."
+              echo "Generated parallel matrix artifact with ${ACTUAL_MATRIX_COUNT} entries."
             else
               echo "::error::Generated matrix JSON is invalid!"
               echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT # Output empty valid matrix on error
+              echo "Generated empty matrix due to JSON error."
             fi
+            # Clean up capped list if it was created
+            rm -f ../repo_list_capped.txt
           else
             # For sequential testing, output a matrix with a single dummy entry.
-            # The actual testing step will ignore this repo value and read the file.
             echo "matrix={\"include\": [{\"repo\":\"sequential_run\"}]}" >> $GITHUB_OUTPUT
             echo "Sequential run triggered, dummy matrix generated."
           fi
 
-          echo "Server List (repo_list.txt, potentially limited):"
-          cat ../repo_list.txt
+          # --- End Matrix Generation Logic ---
+
+
+          echo "Final Server List for Testing (repo_list.txt, potentially limited by max_servers input):"
+
+          cat ../repo_list.txt # Show the list that sequential mode would use, or parallel mode *starts* with
+
 
           cd ..
-          # Keep repo_list.txt for upload
-          rm -rf awesome-list-fork
 
+          # Keep the potentially max_servers-limited repo_list.txt for upload
+
+          rm -f ../repo_list_full.txt # Remove the initial full list
+
+          rm -rf awesome-list-fork
       - name: Upload Server List
         uses: actions/upload-artifact@v4
         with:
           name: repo-list
           path: repo_list.txt
           if-no-files-found: error
-
-  # ==============================================================
-  # Job 2: Test Servers (Parallel or Sequential)
-  # ==============================================================
   test-servers:
-    # ***** CORRECTED NAME LINE *****
-    # Use YAML block scalar syntax to ensure the expression is treated as a single string
-    name: |
-      ${{ github.event.inputs.parallel_testing == true && format('Test Server: {0}', matrix.repo) || 'Test All MCP Servers Sequentially' }}
+    name: >
+      ${{ github.event.inputs.parallel_testing == true && format('Test Server:
+      {0}', matrix.repo) || 'Test All MCP Servers Sequentially' }}
     needs: prepare-server-list
     runs-on: ubuntu-latest
-    # Timeout applies PER JOB instance (important for parallel)
-    timeout-minutes: ${{ github.event.inputs.timeout_minutes || 180 }}
+    timeout-minutes: ${{ github.event.inputs.timeout_minutes }}
     strategy:
-      fail-fast: false # Continue testing other servers even if one fails
+      fail-fast: false
       matrix: ${{ fromJson(needs.prepare-server-list.outputs.server_matrix) }}
-
     steps:
-      # Download the list (needed for sequential mode, harmless for parallel)
       - name: Download Server List
         uses: actions/download-artifact@v4
         with:
           name: repo-list
-          path: . # Download to current directory
-
-      # Cache step (previously corrected, ensure indentation is still valid)
+          path: .
       - name: Setup Tool Versions Cache
         id: tool-versions-cache
         uses: actions/cache@v4
@@ -146,43 +168,60 @@ jobs:
             ~/.deno
             /usr/local/go
             /opt/hostedtoolcache
-          key: ${{ runner.os }}-tools-cache-${{ env.NODE_VERSION }}-${{ env.GO_VERSION }}-v2
-          restore-keys: |
-            ${{ runner.os }}-tools-cache-${{ env.NODE_VERSION }}-${{ env.GO_VERSION }}-
-
-      # Setup tools, using cache information if possible
+          key: ${{ runner.os }}-tools-cache-${{ env.NODE_VERSION }}-${{ env.GO_VERSION
+            }}-v2
+          restore-keys: >
+            ${{ runner.os }}-tools-cache-${{ env.NODE_VERSION }}-${{
+            env.GO_VERSION }}-
       - name: Setup Prerequisites
         shell: bash -eo pipefail {0}
-        run: |
+        run: >
           echo "Setting up tools and dependencies..."
+
           # Install base packages unconditionally
+
           sudo apt-get update
+
           sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg git coreutils jq net-tools # Added net-tools for netstat
+
           echo "Installed base packages (including jq, net-tools)."
 
+
           # Setup Node.js
+
           echo "Setting up Node.js v${{ env.NODE_VERSION }}..."
+
           if ! node --version 2>/dev/null | grep -q "v${{ env.NODE_VERSION }}."; then
             curl -fsSL https://deb.nodesource.com/setup_${{ env.NODE_VERSION }}.x | sudo -E bash -
             sudo apt-get install -y nodejs
           else
             echo "Node.js v${{ env.NODE_VERSION }} already installed or cached."
           fi
+
           echo "Node Version: $(node --version)"; echo "NPM Version: $(npm --version)"
 
+
           # Setup uv
+
           if ! command -v uv &> /dev/null; then
             echo "Setting up uv (not found or not cached)..."; curl -LsSf https://astral.sh/uv/install.sh | sh
           else
             echo "uv found (cached or pre-installed)."
           fi
+
           export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH" # Ensure uv is in PATH
+
           echo "uv Version: $(uv --version || echo 'uv not found')"
 
+
           # Setup Go
+
           # Use cache step output to potentially skip download/install
+
           INSTALLED_GO_VERSION=$(go version 2>/dev/null | awk '{print $3}' | sed 's/go//')
+
           # Check if cache was hit AND go directory exists AND version matches
+
           if [[ "${{ steps.tool-versions-cache.outputs.cache-hit }}" != 'true' || ! -d "/usr/local/go" || "$INSTALLED_GO_VERSION" != "${{ env.GO_VERSION }}" ]]; then
              echo "Setting up Go ${{ env.GO_VERSION }} (not cached or wrong version)..."
              curl -fsSL "https://golang.org/dl/go${{ env.GO_VERSION }}.linux-amd64.tar.gz" -o go.tar.gz
@@ -190,36 +229,51 @@ jobs:
           else
              echo "Go ${{ env.GO_VERSION }} found and cached."
           fi
+
           export PATH="/usr/local/go/bin:$PATH" # Ensure Go is in PATH
+
           echo "Go Version: $(go version)"
 
+
           # Setup Deno
+
           # Use cache step output to potentially skip download/install
+
           if [[ "${{ steps.tool-versions-cache.outputs.cache-hit }}" != 'true' || ! -d "$HOME/.deno" ]]; then
              echo "Setting up Deno (not cached)..."; curl -fsSL https://deno.land/install.sh | sh
           else
              echo "Deno found and cached."
           fi
+
           export DENO_INSTALL="$HOME/.deno"; export PATH="$DENO_INSTALL/bin:$PATH" # Ensure Deno is in PATH
+
           echo "Deno Version: $(deno --version)"
 
+
           # Verify Docker
+
           echo "Verifying Docker..."; docker --version
 
-          # Persist the final PATH for subsequent steps in this job
-          FINAL_PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.deno/bin:/usr/local/go/bin:${PATH}"
-          echo "Final PATH for subsequent steps: $FINAL_PATH"; echo "PATH=$FINAL_PATH" >> $GITHUB_ENV
 
-      # Find available ports dynamically for this job instance
+          # Persist the final PATH for subsequent steps in this job
+
+          FINAL_PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.deno/bin:/usr/local/go/bin:${PATH}"
+
+          echo "Final PATH for subsequent steps: $FINAL_PATH"; echo "PATH=$FINAL_PATH" >> $GITHUB_ENV
       - name: Get Available Ports
         id: get-ports
         shell: bash -eo pipefail {0}
-        run: |
+        run: >
           echo "Identifying available ports for testing..."
+
           JOB_INDEX=${{ strategy.job-index || 0 }}; PORT_OFFSET=$(( JOB_INDEX * 5 ))
+
           BASE_PORT=$(( ${{ env.BASE_HOST_PORT }} + PORT_OFFSET ))
+
           echo "Base port for this job instance (Index: $JOB_INDEX): $BASE_PORT"
+
           available_ports=(); attempts=0; max_attempts=50; current_port=$BASE_PORT
+
           while [[ ${#available_ports[@]} -lt 5 && $attempts -lt $max_attempts ]]; do
             # Use netstat -lntp to avoid grep issues with partial matches, check state LISTEN
             if ! sudo netstat -lntp | awk '{print $4}' | grep -q ":${current_port}$"; then
@@ -227,29 +281,33 @@ jobs:
             fi
             current_port=$((current_port + 1)); attempts=$((attempts + 1))
           done
+
           if [[ ${#available_ports[@]} -lt 5 ]]; then
             echo "::warning::Could not find 5 available consecutive ports starting from $BASE_PORT. Using random high ports."
             needed=$(( 5 - ${#available_ports[@]} )); readarray -t random_ports < <(shuf -i 15000-25000 -n $needed)
             available_ports+=("${random_ports[@]}"); available_ports=("${available_ports[@]:0:5}")
           fi
-          echo "PORT1=${available_ports[0]}" >> $GITHUB_ENV; echo "PORT2=${available_ports[1]}" >> $GITHUB_ENV
-          echo "PORT3=${available_ports[2]}" >> $GITHUB_ENV; echo "PORT4=${available_ports[3]}" >> $GITHUB_ENV
-          echo "PORT5=${available_ports[4]}" >> $GITHUB_ENV
-          echo "Selected ports for this job: ${available_ports[*]}"
 
-      # Main testing step: runs the test_server function
+          echo "PORT1=${available_ports[0]}" >> $GITHUB_ENV; echo "PORT2=${available_ports[1]}" >> $GITHUB_ENV
+
+          echo "PORT3=${available_ports[2]}" >> $GITHUB_ENV; echo "PORT4=${available_ports[3]}" >> $GITHUB_ENV
+
+          echo "PORT5=${available_ports[4]}" >> $GITHUB_ENV
+
+          echo "Selected ports for this job: ${available_ports[*]}"
       - name: Test Server(s)
         id: test-server
         env:
           GH_MCP_TOKEN: ${{ secrets.MCP_TESTER_GITHUB_PAT }}
           PARALLEL_TESTING: ${{ github.event.inputs.parallel_testing || false }}
-          REPO_TO_TEST: ${{ matrix.repo || '' }} # From matrix if parallel
-          # Ports inherited from previous step via GITHUB_ENV
+          REPO_TO_TEST: ${{ matrix.repo || '' }}
         shell: bash -eo pipefail {0}
-        run: |
+        run: >
           mkdir -p test_results
 
+
           # === Test Server Function Definition ===
+
           test_server() {
             local REPO="$1"; local INDEX="$2"; local TOTAL="$3"
             if [ -z "$REPO" ]; then echo "::warning::Empty repo name. Skipping."; return; fi
@@ -660,9 +718,13 @@ jobs:
           } # === End of test_server function ===
 
 
+
           # ========================================================
+
           # === Main Execution Logic (Parallel vs Sequential) ===
+
           # ========================================================
+
           if [[ "$PARALLEL_TESTING" == "true" ]]; then
             echo "--- Parallel Mode: Testing single server ---"
             if [[ -z "$REPO_TO_TEST" || "$REPO_TO_TEST" == "sequential_run" ]]; then
@@ -697,46 +759,42 @@ jobs:
             done
             echo "--- Sequential testing complete ---"
           fi
+
           echo "Test script finished execution."
-
-
-      # Upload all individual test results from this job instance
       - name: Upload Test Results
-        if: always() # Always run to capture logs/results even on failure
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-${{ strategy.job-index || 'sequential' }} # Unique name per job
-          path: test_results/ # Upload the whole directory
-          if-no-files-found: ignore # Don't fail if a job skipped all tests
-
-  # ==============================================================
-  # Job 3: Combine Results and Summarize
-  # ==============================================================
+          name: test-results-${{ strategy.job-index || 'sequential' }}
+          path: test_results/
+          if-no-files-found: ignore
   summarize-results:
     name: Summarize Test Results
-    needs: test-servers # Run after all test jobs complete
+    needs: test-servers
     runs-on: ubuntu-latest
-    # Run if the workflow wasn't cancelled, regardless of test job success/failure
     if: always() && needs.test-servers.result != 'cancelled'
-
     steps:
       - name: Download All Test Results Artifacts
         uses: actions/download-artifact@v4
         with:
-          path: all-test-results # Download all artifacts into this directory
-          pattern: test-results-* # Match artifacts from all test jobs
-          merge-multiple: true # Merge into the single 'all-test-results' directory
-
+          path: all-test-results
+          pattern: test-results-*
+          merge-multiple: true
       - name: Generate Summary Report
-        id: summary # Give step an ID to reference outputs
+        id: summary
         shell: bash -eo pipefail {0}
-        run: |
+        run: >
           echo "Generating summary report..."
+
           RESULTS_DIR="all-test-results"
+
           SUMMARY_FILE="test_summary.md"
+
           JSON_SUMMARY_FILE="test_summary.json"
 
+
           # Check if results directory exists and has JSON files
+
           if [ ! -d "$RESULTS_DIR" ] || ! find "$RESULTS_DIR" -name '*.json' -print -quit | grep -q .; then
             echo "No test result JSON files found in $RESULTS_DIR."
             echo "# Test Summary" > $SUMMARY_FILE
@@ -748,8 +806,11 @@ jobs:
             exit 0
           fi
 
+
           # Combine all JSON results into a single flat array using jq
+
           # -s slurps all files into one array, flatten merges sub-arrays (if any), map(select(. != null)) removes null entries
+
           if ! find "$RESULTS_DIR" -name '*.json' -print0 | xargs -0 jq -s 'flatten | map(select(. != null))' > "$JSON_SUMMARY_FILE"; then
              echo "::error::Failed to combine JSON results using jq."
              echo "# Test Summary" > $SUMMARY_FILE
@@ -761,7 +822,9 @@ jobs:
              exit 1 # Fail the step
           fi
 
+
           # Check if combined file is empty or just '[]' after potential errors/nulls
+
           if [ ! -s "$JSON_SUMMARY_FILE" ] || [ "$(jq 'length' "$JSON_SUMMARY_FILE")" -eq 0 ]; then
              echo "Combined results file is empty or contains no valid JSON objects."
              echo "# Test Summary" > $SUMMARY_FILE
@@ -773,30 +836,51 @@ jobs:
              exit 0
           fi
 
+
           # Generate counts using jq
+
           SUCCESS_COUNT=$(jq '[.[] | select(.status=="SUCCESS")] | length' "$JSON_SUMMARY_FILE")
+
           FAILURE_COUNT=$(jq '[.[] | select(.status=="FAILURE")] | length' "$JSON_SUMMARY_FILE")
+
           SKIPPED_COUNT=$(jq '[.[] | select(.status=="SKIPPED")] | length' "$JSON_SUMMARY_FILE")
+
           TOTAL_COUNT=$(jq 'length' "$JSON_SUMMARY_FILE") # Total valid results processed
 
+
           echo "Summary Counts: Total=$TOTAL_COUNT, Success=$SUCCESS_COUNT, Failure=$FAILURE_COUNT, Skipped=$SKIPPED_COUNT"
+
           echo "failure_count=$FAILURE_COUNT" >> $GITHUB_OUTPUT # Output failure count for workflow status check
 
+
           # Determine overall status for summary
+
           OVERALL_STATUS="Success"
+
           if [[ "$FAILURE_COUNT" -gt 0 ]]; then OVERALL_STATUS="Failure"; fi
+
           echo "summary_status=$OVERALL_STATUS" >> $GITHUB_OUTPUT
 
+
           # Create Markdown Summary
+
           echo "# Test Summary" > $SUMMARY_FILE
+
           echo "\n**Overall Status: $OVERALL_STATUS**" >> $SUMMARY_FILE
+
           printf -- "- **Total Results Processed:** %s\n" "$TOTAL_COUNT" >> $SUMMARY_FILE
+
           printf -- "- ✅ **Success:** %s\n" "$SUCCESS_COUNT" >> $SUMMARY_FILE
+
           printf -- "- ❌ **Failure:** %s\n" "$FAILURE_COUNT" >> $SUMMARY_FILE
+
           printf -- "- ⚠️ **Skipped:** %s\n" "$SKIPPED_COUNT" >> $SUMMARY_FILE
 
+
           # List Failures (if any)
+
           echo "\n## Failures ($FAILURE_COUNT)" >> $SUMMARY_FILE
+
           if [ "$FAILURE_COUNT" -gt 0 ]; then
             # Use jq to format failures nicely for Markdown table or list
              echo "| Repository | Method | Reason | Duration |" >> $SUMMARY_FILE
@@ -806,8 +890,11 @@ jobs:
             echo "_None_" >> $SUMMARY_FILE
           fi
 
+
           # List Skipped (if any)
+
           echo "\n## Skipped ($SKIPPED_COUNT)" >> $SUMMARY_FILE
+
           if [ "$SKIPPED_COUNT" -gt 0 ]; then
             # Use jq to format skipped nicely for Markdown table or list
              echo "| Repository | Method | Reason | Duration |" >> $SUMMARY_FILE
@@ -817,29 +904,33 @@ jobs:
             echo "_None_" >> $SUMMARY_FILE
           fi
 
+
           echo "\nSummary report generated: $SUMMARY_FILE"
+
           echo "Full JSON summary: $JSON_SUMMARY_FILE"
 
-          # Add summary to GitHub step summary page for easy viewing in the Actions UI
-          cat $SUMMARY_FILE >> $GITHUB_STEP_SUMMARY
 
+          # Add summary to GitHub step summary page for easy viewing in the Actions UI
+
+          cat $SUMMARY_FILE >> $GITHUB_STEP_SUMMARY
       - name: Upload Summary Report Artifacts
-        if: always() # Always upload the generated summary files
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-summary-report
           path: |
             test_summary.md
             test_summary.json
-          if-no-files-found: ignore # Don't fail if files weren't created due to earlier errors
-
-      # Final step to explicitly fail the workflow run if failures occurred during tests
+          if-no-files-found: ignore
       - name: Check for Failures in Summary
-        if: always() # Ensure this check runs even if previous steps had warnings/errors
-        run: |
+        if: always()
+        run: >
           # Check the failure count output from the summary step
+
           FAILURE_COUNT="${{ steps.summary.outputs.failure_count }}"
+
           echo "Checking summary failure count: $FAILURE_COUNT"
+
           if [[ "$FAILURE_COUNT" -gt 0 ]]; then
             echo "::error::Detected $FAILURE_COUNT test failure(s) in the summary. Failing workflow."
             exit 1 # Explicitly fail the workflow run
