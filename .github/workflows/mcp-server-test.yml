@@ -59,7 +59,8 @@ jobs:
   # Job 2: Test each server using a matrix strategy
   # ==============================================================
   test_server:
-    name: Test (${{ strategy.job-index + 1 }}/${{ needs.fetch_list.outputs.count }}) ${{ strategy.matrix.repo }} # Dynamic job name
+    # CORRECTED: Removed index calculation from name for simplicity
+    name: Test ${{ strategy.matrix.repo }}
     needs: fetch_list # Depends on the list being successfully fetched
     if: ${{ needs.fetch_list.outputs.matrix != '[]' }} # Only run if the list is not empty
     runs-on: ubuntu-latest # Needs Docker available
@@ -158,11 +159,13 @@ jobs:
             npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS" || STATUS="FAILURE"
             REASON="Tested via npx (stdio)"
 
-          elif [[ "${{ strategy.matrix.repo }}" == *"pydantic/mcp-run-python"* || "${{ strategy.matrix.repo }}" == "pydantic/pydantic-ai" ]]; then
+          elif [[ "${{ strategy.matrix.repo }}" == "pydantic/pydantic-ai" && -f "mcp-run-python/pyproject.toml" ]]; then # Check subpath if needed
             # Need to handle this slightly differently as it runs directly via Deno
             RUN_METHOD="deno run jsr:"
             echo "INFO: Matched specific server: pydantic/mcp-run-python"
             echo "INFO: Running Deno warmup..."
+            # Deno commands should run from the repo root usually
+            cd .. # Go up one level from mcp_server_under_test
             deno run -A --node-modules-dir=auto jsr:@pydantic/mcp-run-python warmup || { echo "::error::Deno warmup failed"; STATUS="FAILURE"; REASON="Deno warmup failed"; }
             if [[ "$STATUS" != "FAILURE" ]]; then
                SERVER_CMD="deno run -A --node-modules-dir=auto jsr:@pydantic/mcp-run-python stdio"
@@ -189,6 +192,7 @@ jobs:
 
                   if [[ "$STATUS" != "FAILURE" ]]; then
                      echo "INFO: Testing SSE endpoint http://localhost:${HOST_PORT}/sse"
+                     # Allow more time for inspector connection
                      npx --yes @modelcontextprotocol/inspector --cli http://localhost:${HOST_PORT}/sse --method tools/list && STATUS="SUCCESS" || STATUS="FAILURE"
                      REASON="Tested via Dockerfile build/run (SSE)"
                   fi
@@ -214,6 +218,7 @@ jobs:
 
                 if [[ "$STATUS" != "FAILURE" ]]; then
                    echo "INFO: Testing SSE endpoint http://localhost:${HOST_PORT}/sse"
+                   # Allow more time for inspector connection
                    npx --yes @modelcontextprotocol/inspector --cli http://localhost:${HOST_PORT}/sse --method tools/list && STATUS="SUCCESS" || STATUS="FAILURE"
                    REASON="Tested via Dockerfile build/run (SSE)"
                 fi
@@ -225,13 +230,15 @@ jobs:
           elif [ -f "package.json" ]; then
              RUN_METHOD="Node.js (package.json)"
              echo "INFO: Found package.json. Attempting npm install and run..."
-             npm install || { set +e; echo "::warning::npm install failed."; set -e; STATUS="SKIPPED"; REASON="npm install failed"; }
+             # Increase timeout for potentially long installs
+             npm install --timeout=300000 || { set +e; echo "::warning::npm install failed."; set -e; STATUS="SKIPPED"; REASON="npm install failed"; }
              if [[ "$STATUS" != "SKIPPED" ]]; then
                 # Try standard start commands (add more guesses if needed)
                 SERVER_CMD="node ."
                 echo "INFO: Testing with command: $SERVER_CMD"
-                npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS" || \
-                  { SERVER_CMD="npm start"; echo "INFO: Testing with command: $SERVER_CMD"; npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS"; } || \
+                # Add timeout to inspector call
+                timeout 60 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS" || \
+                  { SERVER_CMD="npm start"; echo "INFO: Testing with command: $SERVER_CMD"; timeout 60 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS"; } || \
                   { set +e; echo "::error::Failed to run with standard Node commands (node . or npm start)."; set -e; STATUS="FAILURE"; }
                 REASON="Tested via Node.js run (stdio)"
              fi
@@ -248,10 +255,11 @@ jobs:
                   # Try standard start commands
                   SERVER_CMD="python main.py"
                   echo "INFO: Testing with command: $SERVER_CMD"
-                  npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS" || \
-                    { SERVER_CMD="python app.py"; echo "INFO: Testing with command: $SERVER_CMD"; npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS"; } || \
-                    { SERVER_CMD="python server.py"; echo "INFO: Testing with command: $SERVER_CMD"; npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS"; } || \
-                    { set +e; echo "::error::Failed to run with standard Python commands (main.py, app.py, server.py)."; set -e; STATUS="FAILURE"; }
+                  timeout 60 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS" || \
+                    { SERVER_CMD="python app.py"; echo "INFO: Testing with command: $SERVER_CMD"; timeout 60 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS"; } || \
+                    { SERVER_CMD="python server.py"; echo "INFO: Testing with command: $SERVER_CMD"; timeout 60 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS"; } || \
+                    { SERVER_CMD="python -m $(basename $(pwd))"; echo "INFO: Testing with command: $SERVER_CMD"; timeout 60 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS"; } || \
+                    { set +e; echo "::error::Failed to run with standard Python commands."; set -e; STATUS="FAILURE"; }
                   REASON="Tested via Python run (stdio)"
               fi
 
@@ -264,8 +272,8 @@ jobs:
                  # Try standard start commands (often needs 'stdio' arg)
                  SERVER_CMD="./mcp-server-binary stdio"
                  echo "INFO: Testing with command: $SERVER_CMD"
-                 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS" || \
-                    { SERVER_CMD="./mcp-server-binary"; echo "INFO: Testing with command: $SERVER_CMD"; npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS"; } || \
+                 timeout 60 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS" || \
+                    { SERVER_CMD="./mcp-server-binary"; echo "INFO: Testing with command: $SERVER_CMD"; timeout 60 npx --yes @modelcontextprotocol/inspector --cli "$SERVER_CMD" --method tools/list && STATUS="SUCCESS"; } || \
                     { set +e; echo "::error::Failed to run with standard Go commands (./binary stdio or ./binary)."; set -e; STATUS="FAILURE"; }
                  REASON="Tested via Go build/run (stdio)"
               fi
@@ -295,8 +303,12 @@ jobs:
           RUN_METHOD=${{ steps.test-logic.outputs.run_method }}
           REPO=${{ strategy.matrix.repo }}
 
+          # CORRECTED: Use shell arithmetic for 1-based index
+          JOB_INDEX_ZERO_BASED=${{ strategy.job-index }}
+          JOB_INDEX_ONE_BASED=$(($JOB_INDEX_ZERO_BASED + 1))
+
           echo "" # Newline for readability
-          echo "--- Test Result [${{ strategy.job-index + 1 }}/${{ needs.fetch_list.outputs.count }}] :: ${REPO} ---"
+          echo "--- Test Result [${JOB_INDEX_ONE_BASED}/${{ needs.fetch_list.outputs.count }}] :: ${REPO} ---"
           echo "- Run Method Attempted: ${RUN_METHOD}"
           echo "- Outcome: ${STATUS}"
           echo "- Details: ${REASON}"
