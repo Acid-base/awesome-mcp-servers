@@ -138,8 +138,6 @@ jobs:
           echo "Verifying Docker..."; docker --version; echo "Prerequisites setup complete."
       - name: Test Server ${{ matrix.server_repo }}
         id: test-server-step
-        outputs:
-          repo_slug: ${{ steps.generate-slug.outputs.slug }}
         env:
           GH_MCP_TOKEN: ${{ secrets.MCP_TESTER_GITHUB_PAT }}
         shell: bash
@@ -162,7 +160,7 @@ jobs:
 
           REPO_SLUG=$(echo "$REPO" | tr '/' '_' | tr '.' '_' | tr -cd '[:alnum:]_-' | cut -c1-60)
 
-          # Output the slug for the upload step - using a separate step is cleaner but this works too
+          # Output the slug for the upload step using GITHUB_OUTPUT
 
           echo "repo_slug_generated=$REPO_SLUG" >> $GITHUB_OUTPUT
 
@@ -212,7 +210,7 @@ jobs:
             # --- Use the corrected cleanup_subshell ---
             cleanup_subshell() {
               echo "SUB_STATUS='${SUB_STATUS}'" > "$TEMP_RESULT_FILE"
-              local escaped_reason=$(echo "${SUB_REASON}" | sed "s/'/'\\\\''/g")
+              local escaped_reason=$(echo "${SUB_REASON}" | sed "s/'/'\\\\''/g") # Escape single quotes in reason
               echo "SUB_REASON='${escaped_reason}'" >> "$TEMP_RESULT_FILE"
               echo "SUB_RUN_METHOD='${SUB_RUN_METHOD}'" >> "$TEMP_RESULT_FILE"
             }
@@ -296,11 +294,6 @@ jobs:
         id: summary
         shell: bash
         run: >
-          # Adjust RESULTS_DIR if merge-multiple: false (default) was used in
-          download
-
-          # If artifacts are in subdirs, find all json files recursively
-
           RESULTS_DIR="downloaded-results"
 
           SUMMARY_FILE="test_summary.md"
@@ -309,8 +302,6 @@ jobs:
 
 
           echo "Checking for downloaded test results in $RESULTS_DIR..."
-
-          # Find any .json file within the download directory or its subdirectories
 
           json_files=$(find "$RESULTS_DIR" -name '*.json')
 
@@ -322,17 +313,11 @@ jobs:
 
           echo "Combining JSON files from $RESULTS_DIR..."
 
-          # Use find and xargs to pass all found json files to jq
-
-          # This works whether merge-multiple was true or false
-
           if ! find "$RESULTS_DIR" -name '*.json' -print0 | xargs -0 jq --slurp 'flatten | map(select(. != null))' > "$JSON_SUMMARY_FILE"; then
              echo "::error::Failed to combine JSON results using find/xargs/jq. Check files in '$RESULTS_DIR'."
              SUMMARY_CONTENT="### Test Summary\n\nError combining test results."; echo -e "$SUMMARY_CONTENT" > "$SUMMARY_FILE"; echo -e "$SUMMARY_CONTENT" >> "$GITHUB_STEP_SUMMARY"; echo "[]" > "$JSON_SUMMARY_FILE"; echo "failure_count=1" >> "$GITHUB_OUTPUT"; echo "summary_status=Error" >> "$GITHUB_OUTPUT"; exit 1
           fi
 
-
-          # Rest of the summary logic remains the same...
 
           if [ ! -s "$JSON_SUMMARY_FILE" ] || [ "$(jq 'length' "$JSON_SUMMARY_FILE" 2>/dev/null)" == "0" ]; then
              echo "::warning::Combined results file is empty or contains no valid JSON objects after processing '$RESULTS_DIR'."
