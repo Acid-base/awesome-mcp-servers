@@ -147,7 +147,7 @@ jobs:
       {0}', matrix.repo) || 'Test All MCP Servers Sequentially' }}
     needs: prepare-server-list
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event.inputs.timeout_minutes }}
+    timeout-minutes: ${{ toNumber(github.event.inputs.timeout_minutes) }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.prepare-server-list.outputs.server_matrix) }}
