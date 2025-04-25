@@ -37,28 +37,33 @@ jobs:
           cd awesome-list-fork
 
 
-          # Enable sparse checkout and define the pattern
+          # ========================================================= #
 
-          git sparse-checkout init --cone
+          #            >>> Sparse Checkout Fix <<<                    #
 
-          # Write the desired pattern to the config file
+          # Initialize sparse checkout (without --cone), then use set #
 
-          echo 'README.md' > .git/info/sparse-checkout
+          # ========================================================= #
 
-          # Explicitly apply the sparse rules to the working directory
+          git sparse-checkout init
 
-          git checkout # Checkout default branch again, this time applying sparse rules
+          git sparse-checkout set README.md
+
+          # The 'set' command should update the working directory directly
+
+          # No extra 'git checkout' needed here.
+
+          # ========================================================= #
+
+          #          >>> End Sparse Checkout Fix <<<                  #
+
+          # ========================================================= #
 
 
           echo "Parsing README.md..."
 
           if [ ! -f README.md ]; then
-             echo "::error::README.md not found after applying sparse checkout rules."
-             # Add debug info
-             echo "Current directory listing:"
-             ls -la
-             echo "Sparse checkout patterns:"
-             cat .git/info/sparse-checkout || echo "sparse-checkout file not found"
+             echo "::error::README.md not found after sparse checkout set."
              exit 1
           fi
 
@@ -70,8 +75,6 @@ jobs:
             sed 's/\.git$//' | \
             sort -u > ../repo_list_full.txt
 
-          # Rest of the script remains the same...
-
           REPO_COUNT_FULL=$(wc -l < ../repo_list_full.txt || echo 0)
 
           echo "Found $REPO_COUNT_FULL potential servers."
@@ -82,7 +85,13 @@ jobs:
           if [[ "$MAX_SERVERS" -gt 0 && "$MAX_SERVERS" -lt "$REPO_COUNT_FULL" ]]; then
             echo "Limiting to first $MAX_SERVERS servers from the list."
             head -n "$MAX_SERVERS" ../repo_list_full.txt > ../repo_list.txt
-            REPO_COUNT=$(wc -l < ../repo_list_txt || echo 0) # Corrected typo here
+            # ========================================================= #
+            #                   >>> Typo Fix <<<                      #
+            # ========================================================= #
+            REPO_COUNT=$(wc -l < ../repo_list.txt || echo 0) # Corrected typo: repo_list.txt
+            # ========================================================= #
+            #                 >>> End Typo Fix <<<                    #
+            # ========================================================= #
             echo "Testing limited count: $REPO_COUNT servers."
           else
             cp ../repo_list_full.txt ../repo_list.txt
