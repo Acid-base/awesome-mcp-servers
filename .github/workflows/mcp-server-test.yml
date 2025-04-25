@@ -1,3 +1,4 @@
+---
 name: MCP Server Awesome List Tests (Enhanced)
 on:
   workflow_dispatch:
@@ -768,180 +769,175 @@ jobs:
           name: test-results-${{ strategy.job-index || 'sequential' }}
           path: test_results/
           if-no-files-found: ignore
-summarize-results:
-  name: Summarize Test Results
-  needs: test-servers
-  runs-on: ubuntu-latest
-  if: always() && needs.test-servers.result != 'cancelled'
-  steps:
-    - name: Download All Test Results Artifacts
-      uses: actions/download-artifact@v4
-      with:
-        path: all-test-results
-        pattern: test-results-*
-        merge-multiple: true
-    - name: Generate Summary Report
-      id: summary
-      shell: bash -eo pipefail {0}
-      run: >
-        echo "Generating summary report..."
+  summarize-results:
+    name: Summarize Test Results
+    needs: test-servers
+    runs-on: ubuntu-latest
+    if: always() && needs.test-servers.result != 'cancelled'
+    steps:
+      - name: Download All Test Results Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-test-results
+          pattern: test-results-*
+          merge-multiple: true
+      - name: Generate Summary Report
+        id: summary
+        shell: bash -eo pipefail {0}
+        run: >
+          echo "Generating summary report..."
 
-        RESULTS_DIR="all-test-results"
+          RESULTS_DIR="all-test-results"
 
-        SUMMARY_FILE="test_summary.md"         # For artifact (full details)
+          SUMMARY_FILE="test_summary.md"         # For artifact (full details)
 
-        JSON_SUMMARY_FILE="test_summary.json" # For artifact
-
-
-        # --- Initial Setup & JSON Processing (as before) ---
-
-        if [ ! -d "$RESULTS_DIR" ] || ! find "$RESULTS_DIR" -name '*.json' -print -quit | grep -q .; then
-          echo "No test result JSON files found in $RESULTS_DIR."
-          SUMMARY_CONTENT="### Test Summary\n\nNo test results were found to summarize."
-          echo -e "$SUMMARY_CONTENT" > $SUMMARY_FILE # Basic file for artifact
-          echo -e "$SUMMARY_CONTENT" >> $GITHUB_STEP_SUMMARY # Add basic message to step summary
-          echo "[]" > $JSON_SUMMARY_FILE
-          echo "failure_count=0" >> $GITHUB_OUTPUT
-          echo "summary_status=No Results" >> $GITHUB_OUTPUT
-          exit 0
-        fi
-
-        if ! find "$RESULTS_DIR" -name '*.json' -print0 | xargs -0 jq -s 'flatten | map(select(. != null))' > "$JSON_SUMMARY_FILE"; then
-           echo "::error::Failed to combine JSON results using jq."
-           SUMMARY_CONTENT="### Test Summary\n\nError combining test results."
-           echo -e "$SUMMARY_CONTENT" > $SUMMARY_FILE
-           echo -e "$SUMMARY_CONTENT" >> $GITHUB_STEP_SUMMARY
-           echo "[]" > $JSON_SUMMARY_FILE
-           echo "failure_count=1" >> $GITHUB_OUTPUT
-           echo "summary_status=Error" >> $GITHUB_OUTPUT
-           exit 1
-        fi
-
-        if [ ! -s "$JSON_SUMMARY_FILE" ] || [ "$(jq 'length' "$JSON_SUMMARY_FILE")" -eq 0 ]; then
-           echo "Combined results file is empty or contains no valid JSON objects."
-           SUMMARY_CONTENT="### Test Summary\n\nNo valid test results found after combining files."
-           echo -e "$SUMMARY_CONTENT" > $SUMMARY_FILE
-           echo -e "$SUMMARY_CONTENT" >> $GITHUB_STEP_SUMMARY
-           echo "[]" > "$JSON_SUMMARY_FILE"
-           echo "failure_count=0" >> $GITHUB_OUTPUT
-           echo "summary_status=No Valid Results" >> $GITHUB_OUTPUT
-           exit 0
-        fi
+          JSON_SUMMARY_FILE="test_summary.json" # For artifact
 
 
-        # --- Generate Counts & Status (as before) ---
+          # --- Initial Setup & JSON Processing ---
 
-        SUCCESS_COUNT=$(jq '[.[] | select(.status=="SUCCESS")] | length' "$JSON_SUMMARY_FILE")
+          if [ ! -d "$RESULTS_DIR" ] || ! find "$RESULTS_DIR" -name '*.json' -print -quit | grep -q .; then
+            echo "No test result JSON files found in $RESULTS_DIR."
+            SUMMARY_CONTENT="### Test Summary\n\nNo test results were found to summarize."
+            echo -e "$SUMMARY_CONTENT" > $SUMMARY_FILE # Basic file for artifact
+            echo -e "$SUMMARY_CONTENT" >> $GITHUB_STEP_SUMMARY # Add basic message to step summary
+            echo "[]" > $JSON_SUMMARY_FILE
+            echo "failure_count=0" >> $GITHUB_OUTPUT
+            echo "summary_status=No Results" >> $GITHUB_OUTPUT
+            exit 0
+          fi
 
-        FAILURE_COUNT=$(jq '[.[] | select(.status=="FAILURE")] | length' "$JSON_SUMMARY_FILE")
+          if ! find "$RESULTS_DIR" -name '*.json' -print0 | xargs -0 jq -s 'flatten | map(select(. != null))' > "$JSON_SUMMARY_FILE"; then
+             echo "::error::Failed to combine JSON results using jq."
+             SUMMARY_CONTENT="### Test Summary\n\nError combining test results."
+             echo -e "$SUMMARY_CONTENT" > $SUMMARY_FILE
+             echo -e "$SUMMARY_CONTENT" >> $GITHUB_STEP_SUMMARY
+             echo "[]" > $JSON_SUMMARY_FILE
+             echo "failure_count=1" >> $GITHUB_OUTPUT
+             echo "summary_status=Error" >> $GITHUB_OUTPUT
+             exit 1
+          fi
 
-        SKIPPED_COUNT=$(jq '[.[] | select(.status=="SKIPPED")] | length' "$JSON_SUMMARY_FILE")
-
-        TOTAL_COUNT=$(jq 'length' "$JSON_SUMMARY_FILE")
-
-        echo "Summary Counts: Total=$TOTAL_COUNT, Success=$SUCCESS_COUNT, Failure=$FAILURE_COUNT, Skipped=$SKIPPED_COUNT"
-
-        echo "failure_count=$FAILURE_COUNT" >> $GITHUB_OUTPUT
-
-        OVERALL_STATUS="Success"; [[ "$FAILURE_COUNT" -gt 0 ]] && OVERALL_STATUS="Failure"
-
-        echo "summary_status=$OVERALL_STATUS" >> $GITHUB_OUTPUT
-
-
-        # --- Create FULL Markdown Summary File (for Artifact) ---
-
-        echo "# Test Summary (Full Report)" > $SUMMARY_FILE
-
-        echo "\n**Overall Status: $OVERALL_STATUS**" >> $SUMMARY_FILE
-
-        printf -- "- **Total Results Processed:** %s\n" "$TOTAL_COUNT" >> $SUMMARY_FILE
-
-        printf -- "- ✅ **Success:** %s\n" "$SUCCESS_COUNT" >> $SUMMARY_FILE
-
-        printf -- "- ❌ **Failure:** %s\n" "$FAILURE_COUNT" >> $SUMMARY_FILE
-
-        printf -- "- ⚠️ **Skipped:** %s\n" "$SKIPPED_COUNT" >> $SUMMARY_FILE
-
-
-        echo "\n## Failures ($FAILURE_COUNT)" >> $SUMMARY_FILE
-
-        if [ "$FAILURE_COUNT" -gt 0 ]; then
-           echo "| Repository | Method | Reason | Duration |" >> $SUMMARY_FILE
-           echo "|------------|--------|--------|----------|" >> $SUMMARY_FILE
-           # Add gsub to handle newlines in reasons for Markdown table
-           jq -r '.[] | select(.status=="FAILURE") | "| `\(.repo)` | \(.method // "N/A") | \(.reason // "N/A" | gsub("\\|"; "\\\\|") | gsub("\r?\n"; "<br>")) | \(.duration // "N/A")s |"' "$JSON_SUMMARY_FILE" >> $SUMMARY_FILE
-        else
-          echo "_None_" >> $SUMMARY_FILE
-        fi
+          if [ ! -s "$JSON_SUMMARY_FILE" ] || [ "$(jq 'length' "$JSON_SUMMARY_FILE")" -eq 0 ]; then
+             echo "Combined results file is empty or contains no valid JSON objects."
+             SUMMARY_CONTENT="### Test Summary\n\nNo valid test results found after combining files."
+             echo -e "$SUMMARY_CONTENT" > $SUMMARY_FILE
+             echo -e "$SUMMARY_CONTENT" >> $GITHUB_STEP_SUMMARY
+             echo "[]" > "$JSON_SUMMARY_FILE"
+             echo "failure_count=0" >> $GITHUB_OUTPUT
+             echo "summary_status=No Valid Results" >> $GITHUB_OUTPUT
+             exit 0
+          fi
 
 
-        echo "\n## Skipped ($SKIPPED_COUNT)" >> $SUMMARY_FILE
+          # --- Generate Counts & Status ---
 
-        if [ "$SKIPPED_COUNT" -gt 0 ]; then
-           echo "| Repository | Method | Reason | Duration |" >> $SUMMARY_FILE
-           echo "|------------|--------|--------|----------|" >> $SUMMARY_FILE
-           # Add gsub to handle newlines in reasons for Markdown table
-           jq -r '.[] | select(.status=="SKIPPED") | "| `\(.repo)` | \(.method // "N/A") | \(.reason // "N/A" | gsub("\\|"; "\\\\|") | gsub("\r?\n"; "<br>")) | \(.duration // "N/A")s |"' "$JSON_SUMMARY_FILE" >> $SUMMARY_FILE
-        else
-          echo "_None_" >> $SUMMARY_FILE
-        fi
+          SUCCESS_COUNT=$(jq '[.[] | select(.status=="SUCCESS")] | length' "$JSON_SUMMARY_FILE")
 
-        echo "\nFull report generated: $SUMMARY_FILE"
+          FAILURE_COUNT=$(jq '[.[] | select(.status=="FAILURE")] | length' "$JSON_SUMMARY_FILE")
 
-        echo "Full JSON summary: $JSON_SUMMARY_FILE"
+          SKIPPED_COUNT=$(jq '[.[] | select(.status=="SKIPPED")] | length' "$JSON_SUMMARY_FILE")
 
+          TOTAL_COUNT=$(jq 'length' "$JSON_SUMMARY_FILE")
 
-        # --- Generate CONCISE Summary for GitHub Step Summary ---
+          echo "Summary Counts: Total=$TOTAL_COUNT, Success=$SUCCESS_COUNT, Failure=$FAILURE_COUNT, Skipped=$SKIPPED_COUNT"
 
-        # Only add the high-level counts and a note to check the artifact
+          echo "failure_count=$FAILURE_COUNT" >> $GITHUB_OUTPUT
 
-        echo "### Test Summary" >> $GITHUB_STEP_SUMMARY
+          OVERALL_STATUS="Success"; [[ "$FAILURE_COUNT" -gt 0 ]] && OVERALL_STATUS="Failure"
 
-        echo "**Overall Status: $OVERALL_STATUS**" >> $GITHUB_STEP_SUMMARY
-
-        echo "- ✅ **Success:** $SUCCESS_COUNT" >> $GITHUB_STEP_SUMMARY
-
-        echo "- ❌ **Failure:** $FAILURE_COUNT" >> $GITHUB_STEP_SUMMARY
-
-        echo "- ⚠️ **Skipped:** $SKIPPED_COUNT" >> $GITHUB_STEP_SUMMARY
-
-        echo "- **Total Processed:** $TOTAL_COUNT" >> $GITHUB_STEP_SUMMARY
-
-        if [[ "$FAILURE_COUNT" -gt 0 || "$SKIPPED_COUNT" -gt 0 ]]; then
-          echo "" >> $GITHUB_STEP_SUMMARY # Add newline for spacing
-          echo "*See the 'test-summary-report' artifact for detailed failure/skipped lists.*" >> $GITHUB_STEP_SUMMARY
-        fi
-
-        # --- End of concise summary generation ---
+          echo "summary_status=$OVERALL_STATUS" >> $GITHUB_OUTPUT
 
 
-        # DO NOT add the full SUMMARY_FILE to GITHUB_STEP_SUMMARY anymore
+          # --- Create FULL Markdown Summary File (for Artifact) ---
 
-        # cat $SUMMARY_FILE >> $GITHUB_STEP_SUMMARY # <-- REMOVED THIS LINE
-    - name: Upload Summary Report Artifacts
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: test-summary-report
-        path: |
-          test_summary.md
-          test_summary.json
-        if-no-files-found: ignore
-    - name: Check for Failures in Summary
-      if: always()
-      run: >
-        # Check the failure count output from the summary step
+          echo "# Test Summary (Full Report)" > $SUMMARY_FILE
 
-        FAILURE_COUNT="${{ steps.summary.outputs.failure_count }}"
+          echo "\n**Overall Status: $OVERALL_STATUS**" >> $SUMMARY_FILE
 
-        echo "Checking summary failure count: $FAILURE_COUNT"
+          printf -- "- **Total Results Processed:** %s\n" "$TOTAL_COUNT" >> $SUMMARY_FILE
 
-        if [[ "$FAILURE_COUNT" -gt 0 ]]; then
-          echo "::error::Detected $FAILURE_COUNT test failure(s) in the summary. Failing workflow."
-          exit 1 # Explicitly fail the workflow run
-        elif [[ "${{ steps.summary.outputs.summary_status }}" == "Error" ]]; then
-          echo "::error::Summary generation encountered an error. Failing workflow."
-          exit 1 # Fail if summary couldn't be generated properly
-        else
-          echo "No failures detected in the summary report or summary generation succeeded."
-        fi
+          printf -- "- ✅ **Success:** %s\n" "$SUCCESS_COUNT" >> $SUMMARY_FILE
+
+          printf -- "- ❌ **Failure:** %s\n" "$FAILURE_COUNT" >> $SUMMARY_FILE
+
+          printf -- "- ⚠️ **Skipped:** %s\n" "$SKIPPED_COUNT" >> $SUMMARY_FILE
+
+
+          echo "\n## Failures ($FAILURE_COUNT)" >> $SUMMARY_FILE
+
+          if [ "$FAILURE_COUNT" -gt 0 ]; then
+             echo "| Repository | Method | Reason | Duration |" >> $SUMMARY_FILE
+             echo "|------------|--------|--------|----------|" >> $SUMMARY_FILE
+             # Add gsub to handle newlines in reasons for Markdown table
+             jq -r '.[] | select(.status=="FAILURE") | "| `\(.repo)` | \(.method // "N/A") | \(.reason // "N/A" | gsub("\\|"; "\\\\|") | gsub("\r?\n"; "<br>")) | \(.duration // "N/A")s |"' "$JSON_SUMMARY_FILE" >> $SUMMARY_FILE
+          else
+            echo "_None_" >> $SUMMARY_FILE
+          fi
+
+
+          echo "\n## Skipped ($SKIPPED_COUNT)" >> $SUMMARY_FILE
+
+          if [ "$SKIPPED_COUNT" -gt 0 ]; then
+             echo "| Repository | Method | Reason | Duration |" >> $SUMMARY_FILE
+             echo "|------------|--------|--------|----------|" >> $SUMMARY_FILE
+             # Add gsub to handle newlines in reasons for Markdown table
+             jq -r '.[] | select(.status=="SKIPPED") | "| `\(.repo)` | \(.method // "N/A") | \(.reason // "N/A" | gsub("\\|"; "\\\\|") | gsub("\r?\n"; "<br>")) | \(.duration // "N/A")s |"' "$JSON_SUMMARY_FILE" >> $SUMMARY_FILE
+          else
+            echo "_None_" >> $SUMMARY_FILE
+          fi
+
+          echo "\nFull report generated: $SUMMARY_FILE"
+
+          echo "Full JSON summary: $JSON_SUMMARY_FILE"
+
+
+          # --- Generate CONCISE Summary for GitHub Step Summary ---
+
+          # Only add the high-level counts and a note to check the artifact
+
+          echo "### Test Summary" >> $GITHUB_STEP_SUMMARY
+
+          echo "**Overall Status: $OVERALL_STATUS**" >> $GITHUB_STEP_SUMMARY
+
+          echo "- ✅ **Success:** $SUCCESS_COUNT" >> $GITHUB_STEP_SUMMARY
+
+          echo "- ❌ **Failure:** $FAILURE_COUNT" >> $GITHUB_STEP_SUMMARY
+
+          echo "- ⚠️ **Skipped:** $SKIPPED_COUNT" >> $GITHUB_STEP_SUMMARY
+
+          echo "- **Total Processed:** $TOTAL_COUNT" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "$FAILURE_COUNT" -gt 0 || "$SKIPPED_COUNT" -gt 0 ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY # Add newline for spacing
+            echo "*See the 'test-summary-report' artifact for detailed failure/skipped lists.*" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # --- End of concise summary generation ---
+      - name: Upload Summary Report Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-summary-report
+          path: |
+            test_summary.md
+            test_summary.json
+          if-no-files-found: ignore
+      - name: Check for Failures in Summary
+        if: always()
+        run: >
+          # Check the failure count output from the summary step
+
+          FAILURE_COUNT="${{ steps.summary.outputs.failure_count }}"
+
+          echo "Checking summary failure count: $FAILURE_COUNT"
+
+          if [[ "$FAILURE_COUNT" -gt 0 ]]; then
+            echo "::error::Detected $FAILURE_COUNT test failure(s) in the summary. Failing workflow."
+            exit 1 # Explicitly fail the workflow run
+          elif [[ "${{ steps.summary.outputs.summary_status }}" == "Error" ]]; then
+            echo "::error::Summary generation encountered an error. Failing workflow."
+            exit 1 # Fail if summary couldn't be generated properly
+          else
+            echo "No failures detected in the summary report or summary generation succeeded."
+          fi
