@@ -48,8 +48,6 @@ jobs:
           echo "Found $REPO_COUNT_FULL potential servers."
 
 
-          # Use bash arithmetic for comparison even with string inputs
-
           MAX_SERVERS=$((${{ github.event.inputs.max_servers || 0 }}))
 
           if [[ "$MAX_SERVERS" -gt 0 && "$MAX_SERVERS" -lt "$REPO_COUNT_FULL" ]]; then
@@ -140,6 +138,8 @@ jobs:
           echo "Verifying Docker..."; docker --version; echo "Prerequisites setup complete."
       - name: Test Server ${{ matrix.server_repo }}
         id: test-server-step
+        outputs:
+          repo_slug: ${{ steps.generate-slug.outputs.slug }}
         env:
           GH_MCP_TOKEN: ${{ secrets.MCP_TESTER_GITHUB_PAT }}
         shell: bash
@@ -158,7 +158,16 @@ jobs:
 
           CHECKOUT_DIR="${GITHUB_WORKSPACE}/mcp_server_under_test"
 
+          # Generate a safe filename slug
+
           REPO_SLUG=$(echo "$REPO" | tr '/' '_' | tr '.' '_' | tr -cd '[:alnum:]_-' | cut -c1-60)
+
+          # Output the slug for the upload step - using a separate step is cleaner but this works too
+
+          echo "repo_slug_generated=$REPO_SLUG" >> $GITHUB_OUTPUT
+
+          echo "REPO_SLUG for this job: $REPO_SLUG" # Log it
+
 
           RESULT_JSON_FILE="${RESULTS_DIR}/${REPO_SLUG}_result.json"
 
@@ -200,21 +209,15 @@ jobs:
             cd "$CHECKOUT_PATH" || exit 1; set -e
             SUB_STATUS="SKIPPED"; SUB_REASON="No method matched"; SUB_RUN_METHOD="None"
 
-            # ========================================================= #
-            #                   >>> Critical Fix <<<                    #
-            #   This cleanup_subshell function correctly quotes vars    #
-            #   to prevent errors when the parent shell sources them.   #
-            # ========================================================= #
+            # --- Use the corrected cleanup_subshell ---
             cleanup_subshell() {
               echo "SUB_STATUS='${SUB_STATUS}'" > "$TEMP_RESULT_FILE"
-              local escaped_reason=$(echo "${SUB_REASON}" | sed "s/'/'\\\\''/g") # Escape single quotes in reason
+              local escaped_reason=$(echo "${SUB_REASON}" | sed "s/'/'\\\\''/g")
               echo "SUB_REASON='${escaped_reason}'" >> "$TEMP_RESULT_FILE"
               echo "SUB_RUN_METHOD='${SUB_RUN_METHOD}'" >> "$TEMP_RESULT_FILE"
             }
             trap cleanup_subshell EXIT
-            # ========================================================= #
-            #                 >>> End Critical Fix <<<                  #
-            # ========================================================= #
+            # --- End corrected cleanup_subshell ---
 
             # Helper Functions (same as before)
             run_inspector_test() { local SERVER_TARGET="$1"; local METHOD_NAME="$2"; local TEST_TYPE="${3:-stdio}"; echo "--> Testing: $METHOD_NAME ($TEST_TYPE) target: $SERVER_TARGET"; local INSPECTOR_CMD=""; if [[ "$TEST_TYPE" == "stdio" ]]; then INSPECTOR_CMD="npx --yes @modelcontextprotocol/inspector --cli \"$SERVER_TARGET\" --method tools/list"; elif [[ "$TEST_TYPE" == "sse" ]]; then INSPECTOR_CMD="npx --yes @modelcontextprotocol/inspector --sse $SERVER_TARGET --method tools/list"; else echo "::error::Unknown test type '$TEST_TYPE'"; return 1; fi; echo "----> Running Inspector: $INSPECTOR_CMD"; if timeout 180s $INSPECTOR_CMD; then echo "----> Inspector SUCCESS"; SUB_STATUS="SUCCESS"; SUB_REASON="Tested via $METHOD_NAME ($TEST_TYPE)"; SUB_RUN_METHOD="$METHOD_NAME"; return 0; else local ec=$?; echo "----> Inspector FAILURE (EC: $ec)"; SUB_STATUS="FAILURE"; SUB_REASON="Inspector failed (EC: $ec) for $METHOD_NAME ($TEST_TYPE)"; SUB_RUN_METHOD="$METHOD_NAME"; return 1; fi; }
@@ -239,7 +242,7 @@ jobs:
           SUBSHELL_EXIT_CODE=$?
 
 
-          # Process Subshell Results (same as before, relies on corrected trap)
+          # Process Subshell Results
 
           echo "--> Subshell exited with code: $SUBSHELL_EXIT_CODE for ${REPO}"
 
@@ -258,7 +261,7 @@ jobs:
           record_result "$STATUS" "$REASON" "$RUN_METHOD"
 
 
-          # Cleanup (same as before)
+          # Cleanup
 
           echo "--> Cleaning up checkout directory ${CHECKOUT_PATH} and temp files for ${REPO}..."
 
@@ -267,8 +270,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: individual-test-results-${{ github.run_id }}
-          path: ${{ github.workspace }}/individual-results/*_result.json
+          name: result-${{ steps.test-server-step.outputs.repo_slug_generated }}-${{
+            github.run_id }}
+          path: ${{ github.workspace }}/individual-results/${{
+            steps.test-server-step.outputs.repo_slug_generated }}_result.json
           retention-days: 5
           if-no-files-found: warn
   summarize-results:
@@ -282,7 +287,7 @@ jobs:
       - name: Download All Individual Results
         uses: actions/download-artifact@v4
         with:
-          name: individual-test-results-${{ github.run_id }}
+          pattern: result-*-${{ github.run_id }}
           path: downloaded-results
         continue-on-error: true
       - name: Install jq
@@ -291,6 +296,11 @@ jobs:
         id: summary
         shell: bash
         run: >
+          # Adjust RESULTS_DIR if merge-multiple: false (default) was used in
+          download
+
+          # If artifacts are in subdirs, find all json files recursively
+
           RESULTS_DIR="downloaded-results"
 
           SUMMARY_FILE="test_summary.md"
@@ -300,19 +310,29 @@ jobs:
 
           echo "Checking for downloaded test results in $RESULTS_DIR..."
 
-          if [ ! -d "$RESULTS_DIR" ] || ! find "$RESULTS_DIR" -mindepth 1 -maxdepth 1 -name '*.json' -print -quit | grep -q .; then
-            echo "::warning::No individual test result JSON files found in $RESULTS_DIR (or download failed)."
+          # Find any .json file within the download directory or its subdirectories
+
+          json_files=$(find "$RESULTS_DIR" -name '*.json')
+
+          if [ -z "$json_files" ]; then
+            echo "::warning::No individual test result JSON files found under $RESULTS_DIR (or download failed)."
             SUMMARY_CONTENT="### Test Summary\n\nNo test results were found to summarize. This could happen if all test jobs failed before producing results or if the artifact download failed."; echo -e "$SUMMARY_CONTENT" > "$SUMMARY_FILE"; echo -e "$SUMMARY_CONTENT" >> "$GITHUB_STEP_SUMMARY"; echo "[]" > "$JSON_SUMMARY_FILE"; echo "failure_count=0" >> "$GITHUB_OUTPUT"; echo "summary_status=No Results" >> "$GITHUB_OUTPUT"; exit 0
           fi
 
 
           echo "Combining JSON files from $RESULTS_DIR..."
 
-          if ! jq --slurp 'flatten | map(select(. != null))' "$RESULTS_DIR"/*.json > "$JSON_SUMMARY_FILE"; then
-             echo "::error::Failed to combine JSON results. Check individual results in '$RESULTS_DIR'."
+          # Use find and xargs to pass all found json files to jq
+
+          # This works whether merge-multiple was true or false
+
+          if ! find "$RESULTS_DIR" -name '*.json' -print0 | xargs -0 jq --slurp 'flatten | map(select(. != null))' > "$JSON_SUMMARY_FILE"; then
+             echo "::error::Failed to combine JSON results using find/xargs/jq. Check files in '$RESULTS_DIR'."
              SUMMARY_CONTENT="### Test Summary\n\nError combining test results."; echo -e "$SUMMARY_CONTENT" > "$SUMMARY_FILE"; echo -e "$SUMMARY_CONTENT" >> "$GITHUB_STEP_SUMMARY"; echo "[]" > "$JSON_SUMMARY_FILE"; echo "failure_count=1" >> "$GITHUB_OUTPUT"; echo "summary_status=Error" >> "$GITHUB_OUTPUT"; exit 1
           fi
 
+
+          # Rest of the summary logic remains the same...
 
           if [ ! -s "$JSON_SUMMARY_FILE" ] || [ "$(jq 'length' "$JSON_SUMMARY_FILE" 2>/dev/null)" == "0" ]; then
              echo "::warning::Combined results file is empty or contains no valid JSON objects after processing '$RESULTS_DIR'."
