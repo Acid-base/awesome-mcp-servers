@@ -269,8 +269,7 @@ jobs:
             # --- B. Test Logic (Prioritized) in Subshell ---
             TEMP_RESULT_FILE=$(mktemp)
             TEMP_LOG_FILE=$(mktemp)
-            HOST_PORT=$(( ${env.BASE_HOST_PORT} + ( ( CURRENT_INDEX - 1 ) % 20 ) )) # Rotate through a few ports
-
+            HOST_PORT=$(( BASE_HOST_PORT + ( ( CURRENT_INDEX - 1 ) % 20 ) ))
             ( # Start subshell
               cd "$CHECKOUT_PATH" || exit 1; set -e
               SUB_STATUS="SKIPPED"; SUB_REASON="No method matched"; SUB_RUN_METHOD="None"
