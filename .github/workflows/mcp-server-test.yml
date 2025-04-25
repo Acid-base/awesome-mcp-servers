@@ -5,12 +5,12 @@ on:
     inputs:
       timeout_minutes:
         description: Timeout in minutes for EACH server test job
-        type: number
-        default: 60
+        type: string
+        default: "60"
       max_servers:
         description: Maximum number of servers to test (0 for all)
-        type: number
-        default: 256
+        type: string
+        default: "256"
   schedule:
     - cron: 0 5 * * 1
 env:
@@ -48,11 +48,11 @@ jobs:
           echo "Found $REPO_COUNT_FULL potential servers."
 
 
-          # Ensure MAX_SERVERS is treated as a number
+          # Use bash arithmetic for comparison even with string inputs
 
           MAX_SERVERS=$((${{ github.event.inputs.max_servers || 0 }}))
 
-          if [ "$MAX_SERVERS" -gt 0 ] && [ "$MAX_SERVERS" -lt "$REPO_COUNT_FULL" ]; then
+          if [[ "$MAX_SERVERS" -gt 0 && "$MAX_SERVERS" -lt "$REPO_COUNT_FULL" ]]; then
             echo "Limiting to first $MAX_SERVERS servers from the list."
             head -n "$MAX_SERVERS" ../repo_list_full.txt > ../repo_list.txt
             REPO_COUNT=$(wc -l < ../repo_list.txt)
@@ -67,14 +67,12 @@ jobs:
           if [ "$REPO_COUNT" -eq 0 ]; then
             echo "::warning::No server implementations found or list is empty after limit."
             echo "count=0" >> $GITHUB_OUTPUT
-            echo "server_list_json='[]'" >> $GITHUB_OUTPUT # Output empty JSON array
+            echo "server_list_json='[]'" >> $GITHUB_OUTPUT
           else
             echo "Final Server List (repo_list.txt):"
             cat ../repo_list.txt
-            # Create JSON array string using jq for robustness
             SERVER_JSON=$(jq --raw-input --slurp 'split("\n") | map(select(length > 0))' < ../repo_list.txt)
             echo "count=$REPO_COUNT" >> $GITHUB_OUTPUT
-            # Use GitHub Actions multiline string syntax for outputs
             echo "server_list_json<<EOF" >> $GITHUB_OUTPUT
             echo "$SERVER_JSON" >> $GITHUB_OUTPUT
             echo "EOF" >> $GITHUB_OUTPUT
@@ -84,9 +82,9 @@ jobs:
 
           cd ..
 
-          rm -rf awesome-list-fork # Clean up checkout
+          rm -rf awesome-list-fork
 
-          rm -f ../repo_list_full.txt # Clean up intermediate file
+          rm -f ../repo_list_full.txt
       - name: Upload Server List Text File (Optional)
         if: steps.fetch.outputs.repo_count > 0
         uses: actions/upload-artifact@v4
@@ -99,7 +97,7 @@ jobs:
     needs: prepare-server-list
     if: needs.prepare-server-list.outputs.repo_count > 0
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event.inputs.timeout_minutes || 60 }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -148,7 +146,7 @@ jobs:
         run: >
           REPO="${{ matrix.server_repo }}"
 
-          RESULTS_DIR="${GITHUB_WORKSPACE}/individual-results" # Store results here before artifact upload
+          RESULTS_DIR="${GITHUB_WORKSPACE}/individual-results"
 
           mkdir -p "$RESULTS_DIR"
 
@@ -158,9 +156,7 @@ jobs:
           echo "Starting Test for Repo: ${REPO}"; echo "======================================================================"; echo ""
 
 
-          CHECKOUT_DIR="${GITHUB_WORKSPACE}/mcp_server_under_test" # Can reuse name per job
-
-          # Generate a safe filename slug
+          CHECKOUT_DIR="${GITHUB_WORKSPACE}/mcp_server_under_test"
 
           REPO_SLUG=$(echo "$REPO" | tr '/' '_' | tr '.' '_' | tr -cd '[:alnum:]_-' | cut -c1-60)
 
@@ -171,16 +167,12 @@ jobs:
           TEST_START_TIME=$(date +%s); CHECKOUT_PATH="$CHECKOUT_DIR"
 
 
-          # Function to finalize and record result JSON file
-
           record_result() {
             local status="$1"; local reason="$2"; local method="$3"; local duration=$(($(date +%s) - TEST_START_TIME))
             jq -nc --arg repo "$REPO" --arg status "$status" --arg reason "$reason" --arg method "$method" --argjson duration "$duration" \
               '{repo: $repo, status: $status, reason: $reason, method: $method, duration: $duration}' > "$RESULT_JSON_FILE"
-            # Log to job output as well
             local ANNOTATION_REASON=$(echo "$reason" | sed 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')
             echo ""; echo "--- Test Result :: ${REPO} ---"; echo "- Run Method Attempted: ${method}"; echo "- Outcome: ${status}"; echo "- Details: ${reason}"; echo "- Duration: ${duration}s"; echo "--------------------------------------------------"; echo ""
-            # Create annotations for easier UI visibility
             if [[ "$status" == "FAILURE" ]]; then echo "::error title=Test Failed ${REPO}::Repo=${REPO}, Status=${status}, Method=${method}, Reason=${ANNOTATION_REASON}"
             elif [[ "$status" == "SKIPPED" ]]; then echo "::warning title=Test Skipped ${REPO}::Repo=${REPO}, Status=${status}, Method=${method}, Reason=${ANNOTATION_REASON}"
             else echo "::notice title=Test Passed ${REPO}::Repo=${REPO}, Status=${status}, Method=${method}, Reason=${ANNOTATION_REASON}"
@@ -194,9 +186,7 @@ jobs:
 
           echo "--> Cloning URL: $GIT_CLONE_URL"
 
-          # Increase clone timeout slightly? 300s seems okay.
-
-          if ! timeout 300s git clone --depth 1 "$GIT_CLONE_URL" "$CHECKOUT_PATH"; then record_result "SKIPPED" "Checkout failed. URL: $GIT_CLONE_URL" "None"; exit 0; fi # Exit job gracefully if checkout fails
+          if ! timeout 300s git clone --depth 1 "$GIT_CLONE_URL" "$CHECKOUT_PATH"; then record_result "SKIPPED" "Checkout failed. URL: $GIT_CLONE_URL" "None"; exit 0; fi
 
           if [ ! -d "$CHECKOUT_PATH" ] || [ -z "$(ls -A "$CHECKOUT_PATH")" ]; then record_result "SKIPPED" "Checkout empty. URL: $GIT_CLONE_URL" "None"; exit 0; fi
 
@@ -207,36 +197,32 @@ jobs:
 
 
           ( # Start subshell for isolation
-            cd "$CHECKOUT_PATH" || exit 1; set -e # Exit subshell on error
+            cd "$CHECKOUT_PATH" || exit 1; set -e
             SUB_STATUS="SKIPPED"; SUB_REASON="No method matched"; SUB_RUN_METHOD="None"
 
             # ========================================================= #
-            #               >>> Start of Applied Fix <<<                #
+            #                   >>> Critical Fix <<<                    #
+            #   This cleanup_subshell function correctly quotes vars    #
+            #   to prevent errors when the parent shell sources them.   #
             # ========================================================= #
-            # Ensure results are written even on unexpected subshell exit
-            # Uses quoting to handle special characters in variables safely
             cleanup_subshell() {
-              # Use single quotes to ensure the value is treated as a literal string
               echo "SUB_STATUS='${SUB_STATUS}'" > "$TEMP_RESULT_FILE"
-              # Escape any single quotes within the reason itself before wrapping
-              local escaped_reason=$(echo "${SUB_REASON}" | sed "s/'/'\\\\''/g")
+              local escaped_reason=$(echo "${SUB_REASON}" | sed "s/'/'\\\\''/g") # Escape single quotes in reason
               echo "SUB_REASON='${escaped_reason}'" >> "$TEMP_RESULT_FILE"
               echo "SUB_RUN_METHOD='${SUB_RUN_METHOD}'" >> "$TEMP_RESULT_FILE"
             }
-            # ========================================================= #
-            #                >>> End of Applied Fix <<<                 #
-            # ========================================================= #
             trap cleanup_subshell EXIT
+            # ========================================================= #
+            #                 >>> End Critical Fix <<<                  #
+            # ========================================================= #
 
-            # Helper Functions (Inspector, Docker Start/Cleanup) - Modified Docker test
+            # Helper Functions (same as before)
             run_inspector_test() { local SERVER_TARGET="$1"; local METHOD_NAME="$2"; local TEST_TYPE="${3:-stdio}"; echo "--> Testing: $METHOD_NAME ($TEST_TYPE) target: $SERVER_TARGET"; local INSPECTOR_CMD=""; if [[ "$TEST_TYPE" == "stdio" ]]; then INSPECTOR_CMD="npx --yes @modelcontextprotocol/inspector --cli \"$SERVER_TARGET\" --method tools/list"; elif [[ "$TEST_TYPE" == "sse" ]]; then INSPECTOR_CMD="npx --yes @modelcontextprotocol/inspector --sse $SERVER_TARGET --method tools/list"; else echo "::error::Unknown test type '$TEST_TYPE'"; return 1; fi; echo "----> Running Inspector: $INSPECTOR_CMD"; if timeout 180s $INSPECTOR_CMD; then echo "----> Inspector SUCCESS"; SUB_STATUS="SUCCESS"; SUB_REASON="Tested via $METHOD_NAME ($TEST_TYPE)"; SUB_RUN_METHOD="$METHOD_NAME"; return 0; else local ec=$?; echo "----> Inspector FAILURE (EC: $ec)"; SUB_STATUS="FAILURE"; SUB_REASON="Inspector failed (EC: $ec) for $METHOD_NAME ($TEST_TYPE)"; SUB_RUN_METHOD="$METHOD_NAME"; return 1; fi; }
-            run_docker_container() { local IMAGE_TAG="$1"; local CONTAINER_NAME="$2"; local CONTAINER_PORT_INTERNAL="${3:-8080}"; local CONTAINER_PORT_FALLBACK="${4:-6277}"; echo "--> Starting container $CONTAINER_NAME ($IMAGE_TAG) exposing internal port $CONTAINER_PORT_INTERNAL (fallback $CONTAINER_PORT_FALLBACK)..."; if ! docker run -d --rm --name "$CONTAINER_NAME" -P "$IMAGE_TAG"; then echo "::error::Failed to start container $IMAGE_TAG"; return 1; fi; echo "--> Container starting. Waiting 20s for stabilization..."; sleep 20; if ! docker ps --filter "name=$CONTAINER_NAME" --filter "status=running" | grep -q "$CONTAINER_NAME"; then echo "::error::Container $CONTAINER_NAME started but exited prematurely."; cleanup_docker "$CONTAINER_NAME"; return 1; fi; # Find mapped host port for internal port
-             HOST_PORT=$(docker port "$CONTAINER_NAME" "$CONTAINER_PORT_INTERNAL/tcp" 2>/dev/null | sed 's/.*://'); if [ -z "$HOST_PORT" ]; then echo "--> Port $CONTAINER_PORT_INTERNAL not mapped? Trying fallback $CONTAINER_PORT_FALLBACK..."; HOST_PORT=$(docker port "$CONTAINER_NAME" "$CONTAINER_PORT_FALLBACK/tcp" 2>/dev/null | sed 's/.*://'); fi; if [ -z "$HOST_PORT" ]; then echo "::error::Could not find mapped host port for $CONTAINER_PORT_INTERNAL or $CONTAINER_PORT_FALLBACK on container $CONTAINER_NAME."; cleanup_docker "$CONTAINER_NAME"; return 1; fi; echo "--> Container $CONTAINER_NAME ready. Mapped Host Port: $HOST_PORT"; export FOUND_HOST_PORT="$HOST_PORT"; return 0; } # Export found port
+            run_docker_container() { local IMAGE_TAG="$1"; local CONTAINER_NAME="$2"; local CONTAINER_PORT_INTERNAL="${3:-8080}"; local CONTAINER_PORT_FALLBACK="${4:-6277}"; echo "--> Starting container $CONTAINER_NAME ($IMAGE_TAG) exposing internal port $CONTAINER_PORT_INTERNAL (fallback $CONTAINER_PORT_FALLBACK)..."; if ! docker run -d --rm --name "$CONTAINER_NAME" -P "$IMAGE_TAG"; then echo "::error::Failed to start container $IMAGE_TAG"; return 1; fi; echo "--> Container starting. Waiting 20s for stabilization..."; sleep 20; if ! docker ps --filter "name=$CONTAINER_NAME" --filter "status=running" | grep -q "$CONTAINER_NAME"; then echo "::error::Container $CONTAINER_NAME started but exited prematurely."; cleanup_docker "$CONTAINER_NAME"; return 1; fi; HOST_PORT=$(docker port "$CONTAINER_NAME" "$CONTAINER_PORT_INTERNAL/tcp" 2>/dev/null | sed 's/.*://'); if [ -z "$HOST_PORT" ]; then echo "--> Port $CONTAINER_PORT_INTERNAL not mapped? Trying fallback $CONTAINER_PORT_FALLBACK..."; HOST_PORT=$(docker port "$CONTAINER_NAME" "$CONTAINER_PORT_FALLBACK/tcp" 2>/dev/null | sed 's/.*://'); fi; if [ -z "$HOST_PORT" ]; then echo "::error::Could not find mapped host port for $CONTAINER_PORT_INTERNAL or $CONTAINER_PORT_FALLBACK on container $CONTAINER_NAME."; cleanup_docker "$CONTAINER_NAME"; return 1; fi; echo "--> Container $CONTAINER_NAME ready. Mapped Host Port: $HOST_PORT"; export FOUND_HOST_PORT="$HOST_PORT"; return 0; }
             cleanup_docker() { local CONTAINER_NAME="$1"; echo "--> Cleaning up Docker container $CONTAINER_NAME..."; timeout 30s docker stop "$CONTAINER_NAME" > /dev/null 2>&1 || true; timeout 30s docker rm "$CONTAINER_NAME" > /dev/null 2>&1 || true; }
 
-            # --- Detection Logic ---
+            # Detection Logic (same as before)
             echo "--- Detecting Run Method ---"; NORMALIZED_REPO_NAME=$(echo "$REPO" | sed -E 's/^(github\.com|gitlab\.com|gitea\.com)\///' | sed 's/\.git$//');
-            # Ordered checks...
             if [[ "$NORMALIZED_REPO_NAME" == "github/github-mcp-server" ]]; then METHOD="Docker Image (Official GitHub)"; if [ -z "$GH_MCP_TOKEN" ]; then SUB_STATUS="SKIPPED"; SUB_REASON="Required secret: GH_MCP_TOKEN"; else SERVER_CMD="docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN=$GH_MCP_TOKEN ghcr.io/github/github-mcp-server"; run_inspector_test "$SERVER_CMD" "$METHOD"; fi
             elif [[ "$NORMALIZED_REPO_NAME" == "microsoft/playwright-mcp" ]]; then METHOD="npx @playwright/mcp"; SERVER_CMD="npx --yes @playwright/mcp@latest --headless"; run_inspector_test "$SERVER_CMD" "$METHOD"
             elif [[ "$NORMALIZED_REPO_NAME" == "pydantic/pydantic-ai" ]]; then METHOD="deno run jsr:"; (cd "${GITHUB_WORKSPACE}" && timeout 120s deno run -A --node-modules-dir=auto jsr:@pydantic/mcp-run-python warmup) || { SUB_STATUS="FAILURE"; SUB_REASON="Deno warmup failed jsr:@pydantic/mcp-run-python"; exit 1; }; SERVER_CMD="deno run -A --node-modules-dir=auto jsr:@pydantic/mcp-run-python stdio"; run_inspector_test "$SERVER_CMD" "$METHOD"
@@ -248,46 +234,35 @@ jobs:
             else SUB_RUN_METHOD="None"; SUB_STATUS="SKIPPED"; SUB_REASON="No known build/package config found (Dockerfile, package.json, pyproject.toml, requirements.txt, go.mod)"; fi
             echo "--- Subshell test logic complete ---"
 
-          ) > "$TEMP_LOG_FILE" 2>&1 # Redirect subshell stdout/stderr
+          ) > "$TEMP_LOG_FILE" 2>&1
 
           SUBSHELL_EXIT_CODE=$?
 
 
-          # --- Process Subshell Results ---
+          # Process Subshell Results (same as before, relies on corrected trap)
 
           echo "--> Subshell exited with code: $SUBSHELL_EXIT_CODE for ${REPO}"
 
           if [ -f "$TEMP_RESULT_FILE" ]; then
-            # Source the file containing quoted assignments
-            source "$TEMP_RESULT_FILE"
-            # Use default values just in case source somehow failed silently
+            source "$TEMP_RESULT_FILE" # Source the quoted assignments
             STATUS=${SUB_STATUS:-FAILURE}; REASON=${SUB_REASON:-"Result parsing error after source"}; RUN_METHOD=${SUB_RUN_METHOD:-Unknown};
-            # If subshell failed non-zero, but status was success/skipped, override to failure
             if [[ $SUBSHELL_EXIT_CODE -ne 0 && "$STATUS" == "SUCCESS" ]]; then STATUS="FAILURE"; REASON="Success reported but subshell exited non-zero (EC: $SUBSHELL_EXIT_CODE). Original Reason: $REASON"; fi;
             if [[ $SUBSHELL_EXIT_CODE -ne 0 && "$STATUS" == "SKIPPED" ]]; then STATUS="FAILURE"; REASON="Skipped reported but subshell exited non-zero (EC: $SUBSHELL_EXIT_CODE). Original Reason: $REASON"; fi;
           else
-            # This case should be less likely now with the trap fix, but keep for robustness
             echo "::error:: Subshell result file missing for ${REPO}!"; STATUS="FAILURE"; REASON="Subshell failed catastrophically (EC: $SUBSHELL_EXIT_CODE, result file missing)."; RUN_METHOD="Unknown";
           fi
-
-
-          # Log subshell output if not successful
 
           if [[ "$STATUS" != "SUCCESS" ]]; then echo "--- Subshell Log for ${REPO} ---"; cat "$TEMP_LOG_FILE" || echo "Log read error."; echo "--- End Subshell Log ---"; fi
 
 
-          # --- Record final result JSON file ---
-
           record_result "$STATUS" "$REASON" "$RUN_METHOD"
 
 
-          # --- Cleanup ---
+          # Cleanup (same as before)
 
           echo "--> Cleaning up checkout directory ${CHECKOUT_PATH} and temp files for ${REPO}..."
 
           rm -rf "$CHECKOUT_PATH" "$TEMP_LOG_FILE" "$TEMP_RESULT_FILE"
-
-          # Note: Docker containers are cleaned up via --rm flag or cleanup_docker function
       - name: Upload Individual Result
         if: always()
         uses: actions/upload-artifact@v4
@@ -325,8 +300,6 @@ jobs:
 
           echo "Checking for downloaded test results in $RESULTS_DIR..."
 
-          # Check if the directory exists AND contains at least one JSON file
-
           if [ ! -d "$RESULTS_DIR" ] || ! find "$RESULTS_DIR" -mindepth 1 -maxdepth 1 -name '*.json' -print -quit | grep -q .; then
             echo "::warning::No individual test result JSON files found in $RESULTS_DIR (or download failed)."
             SUMMARY_CONTENT="### Test Summary\n\nNo test results were found to summarize. This could happen if all test jobs failed before producing results or if the artifact download failed."; echo -e "$SUMMARY_CONTENT" > "$SUMMARY_FILE"; echo -e "$SUMMARY_CONTENT" >> "$GITHUB_STEP_SUMMARY"; echo "[]" > "$JSON_SUMMARY_FILE"; echo "failure_count=0" >> "$GITHUB_OUTPUT"; echo "summary_status=No Results" >> "$GITHUB_OUTPUT"; exit 0
@@ -335,17 +308,11 @@ jobs:
 
           echo "Combining JSON files from $RESULTS_DIR..."
 
-          # Use jq to combine all *.json files in the directory into one array
-
-          # Handle potential errors during jq processing gracefully
-
           if ! jq --slurp 'flatten | map(select(. != null))' "$RESULTS_DIR"/*.json > "$JSON_SUMMARY_FILE"; then
              echo "::error::Failed to combine JSON results. Check individual results in '$RESULTS_DIR'."
              SUMMARY_CONTENT="### Test Summary\n\nError combining test results."; echo -e "$SUMMARY_CONTENT" > "$SUMMARY_FILE"; echo -e "$SUMMARY_CONTENT" >> "$GITHUB_STEP_SUMMARY"; echo "[]" > "$JSON_SUMMARY_FILE"; echo "failure_count=1" >> "$GITHUB_OUTPUT"; echo "summary_status=Error" >> "$GITHUB_OUTPUT"; exit 1
           fi
 
-
-          # Check if combined file is empty or just '[]'
 
           if [ ! -s "$JSON_SUMMARY_FILE" ] || [ "$(jq 'length' "$JSON_SUMMARY_FILE" 2>/dev/null)" == "0" ]; then
              echo "::warning::Combined results file is empty or contains no valid JSON objects after processing '$RESULTS_DIR'."
@@ -354,8 +321,6 @@ jobs:
 
 
           echo "Calculating summary counts..."
-
-          # Add error handling for jq commands
 
           SUCCESS_COUNT=$(jq '[.[] | select(.status=="SUCCESS")] | length' "$JSON_SUMMARY_FILE") || { echo "::error::jq failed calculating SUCCESS"; exit 1; }
 
@@ -375,7 +340,7 @@ jobs:
           echo "summary_status=$OVERALL_STATUS" >> "$GITHUB_OUTPUT"
 
 
-          # --- Generate Markdown Report ---
+          # Generate Markdown Report (same as before)
 
           echo "Generating full Markdown summary report ($SUMMARY_FILE)..."
 
@@ -384,7 +349,7 @@ jobs:
           echo "Full report generated: $SUMMARY_FILE"
 
 
-          # --- Generate GitHub Step Summary ---
+          # Generate GitHub Step Summary (same as before)
 
           echo "Generating concise summary for GitHub Step Summary..."
 
@@ -411,6 +376,6 @@ jobs:
 
           if [[ "$SUMMARY_STATUS" == "Error" ]]; then echo "::error::Summary generation failed. Failing workflow."; exit 1; fi
 
-          if [[ "$SUMMARY_STATUS" == "No Results" ]] || [[ "$SUMMARY_STATUS" == "No Valid Results" ]]; then echo "::warning::No test results were generated or summarized."; exit 0; fi # Don't fail if no results
+          if [[ "$SUMMARY_STATUS" == "No Results" ]] || [[ "$SUMMARY_STATUS" == "No Valid Results" ]]; then echo "::warning::No test results were generated or summarized."; exit 0; fi
 
           echo "Workflow finished successfully with $SUMMARY_STATUS status and $FAILURE_COUNT failures."
