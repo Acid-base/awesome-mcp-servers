@@ -768,7 +768,6 @@ jobs:
           name: test-results-${{ strategy.job-index || 'sequential' }}
           path: test_results/
           if-no-files-found: ignore
- ---
 summarize-results:
   name: Summarize Test Results
   needs: test-servers
