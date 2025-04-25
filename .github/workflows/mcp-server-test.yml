@@ -30,12 +30,25 @@ jobs:
         run: >
           echo "Checking out fork to get server list..."
 
-          git clone --depth 1 https://github.com/Acid-base/awesome-mcp-servers.git awesome-list-fork
+          # Use sparse checkout to only get the README
+
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/Acid-base/awesome-mcp-servers.git awesome-list-fork
 
           cd awesome-list-fork
 
+          git sparse-checkout init --cone
+
+          git sparse-checkout set README.md
+
+          git checkout # checkout the main/default branch
+
 
           echo "Parsing README.md..."
+
+          if [ ! -f README.md ]; then
+             echo "::error::README.md not found after sparse checkout."
+             exit 1
+          fi
 
           awk '/^## Server Implementations/{flag=1; next} /^## Frameworks/{flag=0} flag' README.md | \
             grep -oE 'https?:\/\/(github\.com|gitlab\.com|gitea\.com)\/[^/]+\/[^)/ ]+' | \
@@ -43,7 +56,7 @@ jobs:
             sed 's/\.git$//' | \
             sort -u > ../repo_list_full.txt
 
-          REPO_COUNT_FULL=$(wc -l < ../repo_list_full.txt)
+          REPO_COUNT_FULL=$(wc -l < ../repo_list_full.txt || echo 0)
 
           echo "Found $REPO_COUNT_FULL potential servers."
 
@@ -53,12 +66,19 @@ jobs:
           if [[ "$MAX_SERVERS" -gt 0 && "$MAX_SERVERS" -lt "$REPO_COUNT_FULL" ]]; then
             echo "Limiting to first $MAX_SERVERS servers from the list."
             head -n "$MAX_SERVERS" ../repo_list_full.txt > ../repo_list.txt
-            REPO_COUNT=$(wc -l < ../repo_list.txt)
+            REPO_COUNT=$(wc -l < ../repo_list.txt || echo 0)
             echo "Testing limited count: $REPO_COUNT servers."
           else
             cp ../repo_list_full.txt ../repo_list.txt
             REPO_COUNT="$REPO_COUNT_FULL"
             echo "Testing full count: $REPO_COUNT servers."
+          fi
+
+
+          # Handle empty list robustly
+
+          if [ ! -s ../repo_list.txt ]; then
+             REPO_COUNT=0
           fi
 
 
@@ -107,33 +127,51 @@ jobs:
         with:
           path: |
             ~/.cache/uv
-            ~/.cargo/bin/uv
+            ~/.cargo/bin # Cache the whole bin dir for uv/etc.
             ~/.deno
-            /usr/local/go
-            /opt/hostedtoolcache/node/${{ env.NODE_VERSION }}
-          key: ${{ runner.os }}-tools-${{ hashFiles('**/package-lock.json', '**/go.sum',
-            '**/requirements*.txt', '**/pyproject.toml') }}-${{ env.NODE_VERSION
-            }}-${{ env.GO_VERSION }}-deno-v1
+          key: ${{ runner.os }}-usertools-${{ hashFiles('**/package-lock.json',
+            '**/go.sum', '**/requirements*.txt', '**/pyproject.toml',
+            '**/uv.lock') }}-${{ env.NODE_VERSION }}-${{ env.GO_VERSION
+            }}-deno-v1
           restore-keys: |
-            ${{ runner.os }}-tools-
+            ${{ runner.os }}-usertools-
       - name: Setup Prerequisites
         shell: bash
         run: >
           echo "Setting up tools and dependencies for ${{ matrix.server_repo }}..."
 
-          # (Setup script remains largely the same as before)
+          # Base packages installation
 
           if ! command -v jq &> /dev/null || ! command -v git &> /dev/null; then echo "Installing base packages (jq, git)..."; sudo apt-get update && sudo apt-get install -y --no-install-recommends jq git coreutils ca-certificates curl gnupg; else echo "Base packages likely already present."; fi
 
+
+          # Node.js Setup (Installs if not present, relies on runner's cached node if possible)
+
           echo "Setting up Node.js v${{ env.NODE_VERSION }}..."
 
-          node_path=$(find /opt/hostedtoolcache/node -maxdepth 1 -name "${{ env.NODE_VERSION }}.*" 2>/dev/null | head -n 1); if [ -z "$node_path" ]; then echo "Node.js not found in cache, installing..."; curl -fsSL https://deb.nodesource.com/setup_${{ env.NODE_VERSION }}.x | sudo -E bash -; sudo apt-get install -y nodejs; else echo "Node.js found in cache."; echo "$node_path/bin" >> $GITHUB_PATH; fi; echo "Node Version: $(node --version)"; echo "NPM Version: $(npm --version)"
+          # Use setup-node action for robust installation/caching
 
-          if ! command -v uv &> /dev/null; then echo "Setting up uv..."; curl -LsSf https://astral.sh/uv/install.sh | sh; fi; echo "$HOME/.cargo/bin" >> $GITHUB_PATH; echo "uv Version: $(uv --version)"
+          # actions/setup-node might be better, but stick to manual for now if preferred
+
+          node_path=$(find /opt/hostedtoolcache/node -maxdepth 1 -name "${{ env.NODE_VERSION }}.*" 2>/dev/null | head -n 1); if [ -z "$node_path" ]; then echo "Node.js not found in runner cache, installing system version..."; curl -fsSL https://deb.nodesource.com/setup_${{ env.NODE_VERSION }}.x | sudo -E bash -; sudo apt-get install -y nodejs; else echo "Node.js found in runner cache."; echo "$node_path/bin" >> $GITHUB_PATH; fi; echo "Node Version: $(node --version)"; echo "NPM Version: $(npm --version)"
+
+
+          # uv Setup (Checks cache path first, then installs)
+
+          if ! command -v uv &> /dev/null; then echo "Setting up uv..."; curl -LsSf https://astral.sh/uv/install.sh | sh; fi; echo "$HOME/.cargo/bin" >> $GITHUB_PATH; echo "uv Version: $(uv --version || echo 'not found')"
+
+
+          # Go Setup (Installs if not present)
 
           if ! command -v go &> /dev/null || ! go version | grep -q "go${{ env.GO_VERSION }}"; then echo "Setting up Go v${{ env.GO_VERSION }}..."; curl -fsSL "https://golang.org/dl/go${{ env.GO_VERSION }}.linux-amd64.tar.gz" -o go.tar.gz; sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf go.tar.gz; rm go.tar.gz; fi; echo "/usr/local/go/bin" >> $GITHUB_PATH; echo "Go Version: $(go version)"
 
-          if ! command -v deno &> /dev/null; then echo "Setting up Deno..."; curl -fsSL https://deno.land/install.sh | sh; fi; echo "$HOME/.deno/bin" >> $GITHUB_PATH; echo "Deno Version: $(deno --version)"
+
+          # Deno Setup (Checks cache path first, then installs)
+
+          if ! command -v deno &> /dev/null; then echo "Setting up Deno..."; curl -fsSL https://deno.land/install.sh | sh; fi; echo "$HOME/.deno/bin" >> $GITHUB_PATH; echo "Deno Version: $(deno --version || echo 'not found')"
+
+
+          # Verify Docker
 
           echo "Verifying Docker..."; docker --version; echo "Prerequisites setup complete."
       - name: Test Server ${{ matrix.server_repo }}
@@ -156,15 +194,11 @@ jobs:
 
           CHECKOUT_DIR="${GITHUB_WORKSPACE}/mcp_server_under_test"
 
-          # Generate a safe filename slug
-
           REPO_SLUG=$(echo "$REPO" | tr '/' '_' | tr '.' '_' | tr -cd '[:alnum:]_-' | cut -c1-60)
 
-          # Output the slug for the upload step using GITHUB_OUTPUT
+          echo "repo_slug_generated=$REPO_SLUG" >> $GITHUB_OUTPUT # Use standard GITHUB_OUTPUT
 
-          echo "repo_slug_generated=$REPO_SLUG" >> $GITHUB_OUTPUT
-
-          echo "REPO_SLUG for this job: $REPO_SLUG" # Log it
+          echo "REPO_SLUG for this job: $REPO_SLUG"
 
 
           RESULT_JSON_FILE="${RESULTS_DIR}/${REPO_SLUG}_result.json"
@@ -210,7 +244,7 @@ jobs:
             # --- Use the corrected cleanup_subshell ---
             cleanup_subshell() {
               echo "SUB_STATUS='${SUB_STATUS}'" > "$TEMP_RESULT_FILE"
-              local escaped_reason=$(echo "${SUB_REASON}" | sed "s/'/'\\\\''/g") # Escape single quotes in reason
+              local escaped_reason=$(echo "${SUB_REASON}" | sed "s/'/'\\\\''/g")
               echo "SUB_REASON='${escaped_reason}'" >> "$TEMP_RESULT_FILE"
               echo "SUB_RUN_METHOD='${SUB_RUN_METHOD}'" >> "$TEMP_RESULT_FILE"
             }
