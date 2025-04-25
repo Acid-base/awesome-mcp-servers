@@ -36,25 +36,33 @@ jobs:
 
           cd awesome-list-fork
 
+          # Configure sparse checkout to only include README.md at the root
+
           git sparse-checkout init --cone
 
           git sparse-checkout set README.md
 
-          git checkout # checkout the main/default branch
+          # REMOVED: git checkout # This line was likely causing the error
 
 
           echo "Parsing README.md..."
 
+          # Check if README.md exists in the sparse working directory
+
           if [ ! -f README.md ]; then
-             echo "::error::README.md not found after sparse checkout."
+             echo "::error::README.md not found after sparse checkout set."
              exit 1
           fi
+
+          # Process the README.md file
 
           awk '/^## Server Implementations/{flag=1; next} /^## Frameworks/{flag=0} flag' README.md | \
             grep -oE 'https?:\/\/(github\.com|gitlab\.com|gitea\.com)\/[^/]+\/[^)/ ]+' | \
             sed -E 's/^https?:\/\///' | \
             sed 's/\.git$//' | \
             sort -u > ../repo_list_full.txt
+
+          # Rest of the script remains the same...
 
           REPO_COUNT_FULL=$(wc -l < ../repo_list_full.txt || echo 0)
 
@@ -74,8 +82,6 @@ jobs:
             echo "Testing full count: $REPO_COUNT servers."
           fi
 
-
-          # Handle empty list robustly
 
           if [ ! -s ../repo_list.txt ]; then
              REPO_COUNT=0
