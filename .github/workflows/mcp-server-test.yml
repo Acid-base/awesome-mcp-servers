@@ -30,40 +30,31 @@ jobs:
         run: >
           echo "Checking out fork to get server list..."
 
-          # Clone without sparse initially, but still shallow and blobless
+          # ========================================================= #
 
-          git clone --depth 1 --filter=blob:none https://github.com/Acid-base/awesome-mcp-servers.git awesome-list-fork
+          #          >>> Simplest Clone - No Filters <<<              #
+
+          # Clone shallowly ONLY - remove sparse and blob filters     #
+
+          # ========================================================= #
+
+          git clone --depth 1 https://github.com/Acid-base/awesome-mcp-servers.git awesome-list-fork
 
           cd awesome-list-fork
 
-
           # ========================================================= #
 
-          #            >>> Sparse Checkout Fix <<<                    #
-
-          # Initialize sparse checkout (without --cone), then use set #
-
-          # ========================================================= #
-
-          git sparse-checkout init
-
-          git sparse-checkout set README.md
-
-          # The 'set' command should update the working directory directly
-
-          # No extra 'git checkout' needed here.
-
-          # ========================================================= #
-
-          #          >>> End Sparse Checkout Fix <<<                  #
+          #      >>> End Simplest Clone - No Filters Fix <<<          #
 
           # ========================================================= #
 
 
           echo "Parsing README.md..."
 
+          # Directly use the README.md file from the standard shallow clone
+
           if [ ! -f README.md ]; then
-             echo "::error::README.md not found after sparse checkout set."
+             echo "::error::README.md not found in standard shallow clone."
              exit 1
           fi
 
@@ -85,13 +76,7 @@ jobs:
           if [[ "$MAX_SERVERS" -gt 0 && "$MAX_SERVERS" -lt "$REPO_COUNT_FULL" ]]; then
             echo "Limiting to first $MAX_SERVERS servers from the list."
             head -n "$MAX_SERVERS" ../repo_list_full.txt > ../repo_list.txt
-            # ========================================================= #
-            #                   >>> Typo Fix <<<                      #
-            # ========================================================= #
-            REPO_COUNT=$(wc -l < ../repo_list.txt || echo 0) # Corrected typo: repo_list.txt
-            # ========================================================= #
-            #                 >>> End Typo Fix <<<                    #
-            # ========================================================= #
+            REPO_COUNT=$(wc -l < ../repo_list.txt || echo 0) # Corrected typo here
             echo "Testing limited count: $REPO_COUNT servers."
           else
             cp ../repo_list_full.txt ../repo_list.txt
