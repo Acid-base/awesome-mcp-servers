@@ -8,7 +8,8 @@ on:
         type: boolean
         default: false
       timeout_minutes:
-        description: Workflow timeout in minutes (per job)
+        description: "Workflow timeout in minutes (per job) - NOTE: Must be manually set
+          in the YAML below"
         type: number
         default: 180
       max_servers:
@@ -147,7 +148,7 @@ jobs:
       {0}', matrix.repo) || 'Test All MCP Servers Sequentially' }}
     needs: prepare-server-list
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ toNumber(github.event.inputs.timeout_minutes) }}
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.prepare-server-list.outputs.server_matrix) }}
