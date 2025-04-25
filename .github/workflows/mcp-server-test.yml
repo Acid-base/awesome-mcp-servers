@@ -210,7 +210,9 @@ jobs:
             echo "uv found (cached or pre-installed)."
           fi
 
-          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH" # Ensure uv is in PATH
+          # Ensure uv's directory is in PATH for subsequent commands in this step AND persisted via GITHUB_ENV later
+
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 
           echo "uv Version: $(uv --version || echo 'uv not found')"
 
@@ -231,7 +233,9 @@ jobs:
              echo "Go ${{ env.GO_VERSION }} found and cached."
           fi
 
-          export PATH="/usr/local/go/bin:$PATH" # Ensure Go is in PATH
+          # Ensure Go's directory is in PATH for subsequent commands in this step AND persisted via GITHUB_ENV later
+
+          export PATH="/usr/local/go/bin:$PATH"
 
           echo "Go Version: $(go version)"
 
@@ -246,7 +250,9 @@ jobs:
              echo "Deno found and cached."
           fi
 
-          export DENO_INSTALL="$HOME/.deno"; export PATH="$DENO_INSTALL/bin:$PATH" # Ensure Deno is in PATH
+          # Ensure Deno's directory is in PATH for subsequent commands in this step AND persisted via GITHUB_ENV later
+
+          export DENO_INSTALL="$HOME/.deno"; export PATH="$DENO_INSTALL/bin:$PATH"
 
           echo "Deno Version: $(deno --version)"
 
@@ -257,6 +263,8 @@ jobs:
 
 
           # Persist the final PATH for subsequent steps in this job
+
+          # Order matters: Add newly exported paths at the beginning
 
           FINAL_PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.deno/bin:/usr/local/go/bin:${PATH}"
 
@@ -277,6 +285,7 @@ jobs:
 
           while [[ ${#available_ports[@]} -lt 5 && $attempts -lt $max_attempts ]]; do
             # Use netstat -lntp to avoid grep issues with partial matches, check state LISTEN
+            # Use sudo as netstat -p requires root privileges
             if ! sudo netstat -lntp | awk '{print $4}' | grep -q ":${current_port}$"; then
               available_ports+=($current_port)
             fi
@@ -315,9 +324,11 @@ jobs:
             REPO=$(echo "$REPO" | sed 's:/*$::')
             command -v tr >/dev/null 2>&1 || { echo "::error:: 'tr' not found!"; exit 1; }
             REPO_SLUG=$(echo "$REPO" | tr '/' '_' | tr '.' '_')
-            echo; echo "======================================================================"
+            echo # Newline for clarity
+            echo "======================================================================"
             echo "Starting Test [$INDEX/$TOTAL]: ${REPO} (Slug: ${REPO_SLUG})"
-            echo "======================================================================"; echo ""
+            echo "======================================================================"
+            echo # Newline for clarity
             local CHECKOUT_DIR="${GITHUB_WORKSPACE}/mcp_server_under_test_${INDEX}"; local STATUS="SKIPPED"
             local REASON="Test logic did not complete."; local RUN_METHOD="None"; local TEST_START_TIME=$(date +%s)
             local TEST_LOG="${GITHUB_WORKSPACE}/test_results/${REPO_SLUG}.log"
@@ -330,8 +341,18 @@ jobs:
             # Helper function to record the result (JSON and Annotation)
             record_result() { # Helper START
               local res_status="$1"; local res_reason="$2"; local res_method="$3"; local duration=$(($(date +%s) - TEST_START_TIME))
-              echo; echo "--- Test Result [$INDEX/$TOTAL] :: ${REPO} ---" | tee -a "$TEST_LOG"; echo "- Method: ${res_method}" | tee -a "$TEST_LOG"; echo "- Outcome: ${res_status}" | tee -a "$TEST_LOG"; echo "- Details: ${res_reason}" | tee -a "$TEST_LOG"; echo "- Duration: ${duration}s" | tee -a "$TEST_LOG"; echo "--------------------------------------------------" | tee -a "$TEST_LOG"
-              command -v jq >/dev/null 2>&1 || { echo "::error:: 'jq' not found!"; return 1; }; jq -nc --arg repo "$REPO" --arg status "$res_status" --arg reason "$res_reason" --arg method "$res_method" --argjson duration "$duration" '{repo: $repo, status: $status, reason: $reason, method: $method, duration: $duration}' > "$RESULT_FILE"
+              echo # Newline for clarity
+              echo "--- Test Result [$INDEX/$TOTAL] :: ${REPO} ---" | tee -a "$TEST_LOG"
+              echo "- Method: ${res_method}" | tee -a "$TEST_LOG"
+              echo "- Outcome: ${res_status}" | tee -a "$TEST_LOG"
+              echo "- Details: ${res_reason}" | tee -a "$TEST_LOG"
+              echo "- Duration: ${duration}s" | tee -a "$TEST_LOG"
+              echo "--------------------------------------------------" | tee -a "$TEST_LOG"
+              # Ensure jq is available before using it
+              command -v jq >/dev/null 2>&1 || { echo "::error:: 'jq' not found! Cannot record JSON result."; return 1; }
+              jq -nc --arg repo "$REPO" --arg status "$res_status" --arg reason "$res_reason" --arg method "$res_method" --argjson duration "$duration" \
+                '{repo: $repo, status: $status, reason: $reason, method: $method, duration: $duration}' > "$RESULT_FILE"
+              # Prepare reason for annotation (escape special characters)
               local ANNOTATION_REASON=$(echo "$res_reason" | sed 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g');
               if [[ "$res_status" == "FAILURE" ]]; then
                 echo "::error title=Test Failed [$INDEX/$TOTAL] ${REPO}::Repo=${REPO}, Status=${res_status}, Method=${res_method}, Reason=${ANNOTATION_REASON}"
@@ -353,20 +374,23 @@ jobs:
                 local inspector_cmd;
                 local inspector_timeout="180s"; # Timeout for the inspector process itself
                 local tools_list_method="tools/list"
-                local inspect_cmd="npx --yes @modelcontextprotocol/inspector"
+                # Ensure npx runs correctly even if PATH wasn't immediately updated in current shell instance
+                local inspect_cmd_path
+                inspect_cmd_path=$(command -v npx) || { echo "::error:: npx command not found!"; return 1; }
+                local inspect_cmd="$inspect_cmd_path --yes @modelcontextprotocol/inspector"
 
                 if [[ "$test_type" == "stdio" ]]; then
                     # For stdio, pass the server command directly to --cli
-                    inspector_cmd=(timeout "$inspector_timeout" "$inspect_cmd" --cli "$server_cmd" --method "$tools_list_method")
+                    inspector_cmd=(timeout "$inspector_timeout" $inspect_cmd --cli "$server_cmd" --method "$tools_list_method")
                 elif [[ "$test_type" == "sse" ]]; then
                     # For SSE, the server_cmd is actually the URL
                     local sse_url="$server_cmd"
-                    inspector_cmd=(timeout "$inspector_timeout" "$inspect_cmd" --sse "$sse_url" --method "$tools_list_method")
+                    inspector_cmd=(timeout "$inspector_timeout" $inspect_cmd --sse "$sse_url" --method "$tools_list_method")
                 else
                     echo "::error::Unknown inspector test type: $test_type"; return 1;
                 fi
 
-                echo "--> Running: ${inspector_cmd[*]}" | sed "s/$GH_MCP_TOKEN/<GH_MCP_TOKEN_REDACTED>/g" # Avoid logging token
+                echo "--> Running command (token redacted): ${inspector_cmd[*]}" | sed "s/$GH_MCP_TOKEN/<GH_MCP_TOKEN_REDACTED>/g" # Avoid logging token
                 # Execute the command, capture output and exit code
                 inspector_output=$( "${inspector_cmd[@]}" 2>&1 )
                 local exit_code=$?
@@ -374,17 +398,17 @@ jobs:
 
                 if [[ $exit_code -eq 0 ]]; then
                     echo "--> Inspector test PASSED ($test_name)."
-                    # Pass on success
+                    # Pass on success - RECORD the result here
                     record_result "SUCCESS" "Inspector test ($test_type) passed." "$test_name"
                     return 0 # Signal success to calling code
                 elif [[ $exit_code -eq 124 ]]; then # Timeout exit code
                      echo "::warning::Inspector test TIMED OUT after $inspector_timeout ($test_name). Exit code: $exit_code"
-                     # Treat timeout as failure for reporting, but allow outer function to continue if needed
+                     # Treat timeout as failure for reporting - RECORD the result here
                      record_result "FAILURE" "Inspector test ($test_type) timed out after $inspector_timeout." "$test_name"
                      return 1 # Signal failure
                 else
                     echo "::warning::Inspector test FAILED ($test_name). Exit code: $exit_code"
-                    # Treat other non-zero exits as failure
+                    # Treat other non-zero exits as failure - RECORD the result here
                     record_result "FAILURE" "Inspector test ($test_type) failed (Exit code: $exit_code)." "$test_name"
                     return 1 # Signal failure
                 fi
@@ -401,7 +425,8 @@ jobs:
                     echo "--> Trying internal port $internal_port..."
                     docker run -d --rm --name "$container_name" -p "${host_port}:${internal_port}" "$image_tag" &> docker_run.log
                     local run_exit_code=$?
-                    sleep 8 # Allow more time for container to potentially start/stabilize
+                    # Allow more time for container to potentially start/stabilize before checking
+                    sleep 8
 
                     if docker ps --filter "name=$container_name" --filter "status=running" | grep -q "$container_name"; then
                         echo "--> Container '$container_name' is running, mapped HOST:${host_port} -> CONTAINER:${internal_port}."
@@ -410,7 +435,7 @@ jobs:
                     else
                         echo "--> Container '$container_name' failed to start/stay running with internal port $internal_port. Exit hint: $run_exit_code. Log: $(cat docker_run.log || echo N/A)"
                         rm -f docker_run.log
-                        # Ensure cleanup before next attempt
+                        # Ensure cleanup before next attempt - stop might fail if not running, ignore errors
                         docker stop "$container_name" > /dev/null 2>&1 || true
                         docker rm "$container_name" > /dev/null 2>&1 || true
                     fi
@@ -428,7 +453,8 @@ jobs:
               echo "--> Cleaning up Docker container $container_name...";
               # Use timeout for stop, then force remove
               timeout 15s docker stop "$container_name" > /dev/null 2>&1
-              docker rm -f "$container_name" > /dev/null 2>&1 || true # Force remove if stop failed/timed out
+              # Force remove if stop failed/timed out or if container exited quickly
+              docker rm -f "$container_name" > /dev/null 2>&1 || true
               echo "--> Cleanup attempt finished for $container_name."
             } # Helper END
 
@@ -446,7 +472,8 @@ jobs:
             else
               echo "::warning::Cannot determine Git URL structure for: ${REPO}. Skipping."
               record_result "SKIPPED" "Unknown repository URL format: $REPO" "None"
-              cd "$GITHUB_WORKSPACE" || exit 1 # Return to base directory
+              # Need to change back to workspace directory before returning
+              cd "$GITHUB_WORKSPACE" || exit 1
               return # Exit function early
             fi
 
@@ -461,7 +488,9 @@ jobs:
               cd "$GITHUB_WORKSPACE" || exit 1
               return
             fi
-            echo "--> Checkout successful."; cd "$CHECKOUT_DIR" || { echo "::error::Failed to cd into $CHECKOUT_DIR"; exit 1; }
+            echo "--> Checkout successful."
+            # Change directory into the checkout directory
+            cd "$CHECKOUT_DIR" || { echo "::error::Failed to cd into checked out directory $CHECKOUT_DIR"; exit 1; }
 
 
             # --- Detect and test ---
@@ -471,7 +500,9 @@ jobs:
             local DOCKER_CONTAINER_NAME="mcp-server-test-${REPO_SLUG}" # Define here for cleanup
 
             # Ensure cleanup happens on exit/error within the function
-            trap 'echo "--> Test function exiting..."; cd "$GITHUB_WORKSPACE"; cleanup_docker "$DOCKER_CONTAINER_NAME"; exec >&1 2>&1;' EXIT
+            # Trap should run in the subshell where the function executes
+            trap 'echo "--> Test function exiting, running cleanup trap..."; cd "$GITHUB_WORKSPACE"; cleanup_docker "$DOCKER_CONTAINER_NAME"; exec >&1 2>&1;' EXIT
+
 
             # P1: Known Servers (using normalized name)
             if [[ "$NORMALIZED_REPO_NAME" == "github/github-mcp-server" ]]; then
@@ -479,31 +510,31 @@ jobs:
                 echo "--> Matched: $RUN_METHOD"
                 if [ -z "$GH_MCP_TOKEN" ]; then record_result "SKIPPED" "Secret MCP_TESTER_GITHUB_PAT not set" "$RUN_METHOD"; return; fi
                 SERVER_CMD="docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN=$GH_MCP_TOKEN ghcr.io/github/github-mcp-server"
-                # run_inspector_test will call record_result internally
-                if run_inspector_test "$SERVER_CMD" "$RUN_METHOD" "stdio"; then return; fi # Exit if successful
-                # If failed, record_result was already called by run_inspector_test
-                return # Exit function regardless of outcome
+                # run_inspector_test will call record_result internally and return 0 for success, 1 for failure
+                run_inspector_test "$SERVER_CMD" "$RUN_METHOD" "stdio"
+                # The trap will handle cleanup regardless of success/failure
+                return # Exit function after test attempt
             fi
 
             if [[ "$NORMALIZED_REPO_NAME" == "microsoft/playwright-mcp" ]]; then
                 RUN_METHOD="npx @playwright/mcp"
                 echo "--> Matched: $RUN_METHOD"
                 SERVER_CMD="npx --yes @playwright/mcp@latest --headless"
-                if run_inspector_test "$SERVER_CMD" "$RUN_METHOD" "stdio"; then return; fi
-                return
+                run_inspector_test "$SERVER_CMD" "$RUN_METHOD" "stdio"
+                return # Exit function after test attempt
             fi
 
             if [[ "$NORMALIZED_REPO_NAME" == "pydantic/pydantic-ai" ]]; then
                 RUN_METHOD="deno run jsr:"
                 echo "--> Matched: $RUN_METHOD"
-                # Run warmup from workspace to avoid polluting checkout dir? Or maybe inside? Let's try workspace.
+                # Run warmup from workspace to avoid polluting checkout dir
                 if ! (cd "${GITHUB_WORKSPACE}" && timeout 120s deno run -A --node-modules-dir=auto jsr:@pydantic/mcp-run-python warmup); then
                     record_result "FAILURE" "Deno warmup failed (jsr:@pydantic/mcp-run-python warmup)" "$RUN_METHOD"
-                    return
+                    return # Exit on failure
                 fi
                 SERVER_CMD="deno run -A --node-modules-dir=auto jsr:@pydantic/mcp-run-python stdio"
-                if run_inspector_test "$SERVER_CMD" "$RUN_METHOD" "stdio"; then return; fi
-                return
+                run_inspector_test "$SERVER_CMD" "$RUN_METHOD" "stdio"
+                return # Exit function after test attempt
             fi
 
 
@@ -528,12 +559,9 @@ jobs:
                         sleep 15
                         # Test via SSE
                         TEST_URL="http://localhost:${HOST_PORT}/sse" # Assuming /sse is the standard endpoint
-                        if run_inspector_test "$TEST_URL" "$RUN_METHOD" "sse"; then
-                            # Test passed, cleanup handled by trap
-                            return
-                        fi
-                        # Inspector test failed (SSE) - run_inspector_test already recorded failure
-                        return # Exit function after failure
+                        run_inspector_test "$TEST_URL" "$RUN_METHOD" "sse"
+                        # Trap will handle cleanup regardless of success/failure
+                        return # Exit function after test attempt
                     else
                         # run_docker_container failed
                         record_result "FAILURE" "Docker run failed for image $IMAGE_TAG" "$RUN_METHOD"
@@ -567,38 +595,40 @@ jobs:
 
                 if ! $INSTALL_SUCCESS; then
                     record_result "FAILURE" "npm install/ci failed" "$RUN_METHOD"
-                    return
+                    return # Exit on failure
                 fi
                 echo "--> Node dependencies installed."
 
                 # Try common start methods
-                SERVER_CMD=""
                 # Check if 'start' script exists
                 if node -e "process.exit(require('./package.json').scripts?.start ? 0 : 1)" 2>/dev/null; then
                     echo "--> Trying 'npm start'..."
                     SERVER_CMD="npm start"
+                    # If inspector passes (returns 0), the function will record success and we can exit
                     if run_inspector_test "$SERVER_CMD" "$RUN_METHOD (npm start)" "stdio"; then return; fi
-                    # Reset SERVER_CMD if it failed
-                    SERVER_CMD=""
                 fi
 
                 # Check 'main' field or default to index.js
                 MAIN_FILE=$(node -p "try{require('./package.json').main||'index.js'}catch(e){'index.js'}" 2>/dev/null)
                 if [ -f "$MAIN_FILE" ]; then
-                    echo "--> Trying 'node $MAIN_FILE' (from main field)..."
+                    echo "--> Trying 'node $MAIN_FILE' (from package.json main)..."
                     SERVER_CMD="node $MAIN_FILE"
                      if run_inspector_test "$SERVER_CMD" "$RUN_METHOD (node main)" "stdio"; then return; fi
-                     SERVER_CMD=""
-                elif [ -f "index.js" ] && [[ "$MAIN_FILE" != "index.js" ]]; then # Try index.js if main failed or wasn't index.js
+                # Try index.js only if it exists and is different from the 'main' file already tried
+                elif [ -f "index.js" ] && [[ "$MAIN_FILE" != "index.js" ]]; then
                      echo "--> Trying 'node index.js' (default)..."
                      SERVER_CMD="node index.js"
                      if run_inspector_test "$SERVER_CMD" "$RUN_METHOD (node index.js)" "stdio"; then return; fi
-                     SERVER_CMD=""
                 fi
 
-                 # If all stdio tests failed, record final failure for Node.js
-                 record_result "FAILURE" "All Node.js stdio test methods failed." "$RUN_METHOD"
-                 return
+                # If we reach here, all attempted Node.js methods failed.
+                # The last call to run_inspector_test would have already recorded the failure.
+                # If no methods were even attempted (e.g., no start script, no main file), record failure now.
+                # Check if a failure was already recorded by checking the RESULT_FILE content
+                if ! jq -e '.status == "FAILURE"' "$RESULT_FILE" > /dev/null 2>&1; then
+                    record_result "FAILURE" "No suitable Node.js entry point (start script, main file) found or tested successfully." "$RUN_METHOD"
+                fi
+                return # Exit function
             fi
 
 
@@ -609,70 +639,80 @@ jobs:
                 # Create venv
                 if ! uv venv .venv --seed; then record_result "FAILURE" "uv venv creation failed" "$RUN_METHOD"; return; fi
                 # Activate venv - need to use 'source' which requires bash context
-                if ! source .venv/bin/activate; then record_result "FAILURE" "Python venv activation failed" "$RUN_METHOD"; return; fi
-                echo "--> Python venv activated."
+                # Run subsequent commands in a subshell to keep venv activated
+                (
+                  source .venv/bin/activate || { echo "::error::Python venv activation failed"; exit 1; }
+                  echo "--> Python venv activated."
 
-                # Install dependencies using uv
-                INSTALL_CMD=""
-                INSTALL_DESC=""
-                if [ -f "pyproject.toml" ] && grep -qE '^\s*\[project\]' pyproject.toml; then
-                    INSTALL_CMD="uv pip install '.[all]' || uv pip install '.'" # Try with extras first
-                    INSTALL_DESC="uv pip install .[all] or ."
-                elif [ -f "requirements.lock" ] || [ -f "uv.lock" ]; then
-                    INSTALL_CMD="uv sync --locked || uv sync" # Try locked first
-                    INSTALL_DESC="uv sync --locked or uv sync"
-                elif [ -f "requirements.txt" ]; then
-                    INSTALL_CMD="uv pip install -r requirements.txt"
-                    INSTALL_DESC="uv pip install -r requirements.txt"
-                else
-                    # Fallback: assume pyproject.toml exists but might not have [project] section standardly
-                    # Or only setup.py exists (less common now)
-                    INSTALL_CMD="uv pip install '.'"
-                    INSTALL_DESC="uv pip install ."
+                  # Install dependencies using uv
+                  INSTALL_CMD=""
+                  INSTALL_DESC=""
+                  if [ -f "pyproject.toml" ] && grep -qE '^\s*\[project\]' pyproject.toml; then
+                      INSTALL_CMD="uv pip install '.[all]' || uv pip install '.'" # Try with extras first
+                      INSTALL_DESC="uv pip install .[all] or ."
+                  elif [ -f "requirements.lock" ] || [ -f "uv.lock" ]; then
+                      INSTALL_CMD="uv sync --locked || uv sync" # Try locked first
+                      INSTALL_DESC="uv sync --locked or uv sync"
+                  elif [ -f "requirements.txt" ]; then
+                      INSTALL_CMD="uv pip install -r requirements.txt"
+                      INSTALL_DESC="uv pip install -r requirements.txt"
+                  else
+                      # Fallback: assume pyproject.toml exists but might not have [project] section standardly
+                      INSTALL_CMD="uv pip install '.'"
+                      INSTALL_DESC="uv pip install ."
+                  fi
+
+                  echo "--> Installing Python dependencies using: $INSTALL_DESC"
+                  # Run install in a subshell to handle potential || logic correctly with timeout
+                  if ! timeout 480s bash -c "$INSTALL_CMD"; then
+                      echo "::error::Python dependency install failed ($INSTALL_DESC)"
+                      # Record failure outside subshell later if needed
+                      exit 1 # Exit subshell on failure
+                  fi
+                  echo "--> Python dependencies installed."
+
+                  # Try common execution methods (stdio)
+                  PYTHON_EXEC="python" # Could also be python3
+                  TEST_PASSED=false
+
+                  declare -a python_files=("main.py" "app.py" "server.py")
+                  for py_file in "${python_files[@]}"; do
+                      if [ -f "$py_file" ]; then
+                          echo "--> Trying '$PYTHON_EXEC $py_file'..."
+                          SERVER_CMD="$PYTHON_EXEC $py_file"
+                          if run_inspector_test "$SERVER_CMD" "$RUN_METHOD ($py_file)" "stdio"; then TEST_PASSED=true; break; fi
+                      fi
+                  done
+
+                  # Try running as module if no file worked
+                  if ! $TEST_PASSED; then
+                      # Infer module name from directory name (replace hyphens with underscores)
+                      PY_MODULE_NAME=$(basename "$PWD" | sed 's/-/_/g')
+                      if [ -d "$PY_MODULE_NAME" ] || [ -f "${PY_MODULE_NAME}.py" ]; then
+                          echo "--> Trying '$PYTHON_EXEC -m $PY_MODULE_NAME'..."
+                          SERVER_CMD="$PYTHON_EXEC -m $PY_MODULE_NAME"
+                          if run_inspector_test "$SERVER_CMD" "$RUN_METHOD (-m module)" "stdio"; then TEST_PASSED=true; fi
+                      fi
+                  fi
+
+                  # Exit subshell with success code if a test passed, failure otherwise
+                  if $TEST_PASSED; then exit 0; else exit 1; fi
+                )
+                # Capture the exit code of the subshell
+                subshell_exit_code=$?
+                echo "--> Python venv section finished (Exit code: $subshell_exit_code)."
+
+                # If subshell failed (install or all tests failed) and no failure recorded yet
+                if [[ $subshell_exit_code -ne 0 ]] && ! jq -e '.status == "FAILURE"' "$RESULT_FILE" > /dev/null 2>&1; then
+                   # Check if install failed vs test failed
+                   if grep -q "Python dependency install failed" "$TEST_LOG"; then
+                       record_result "FAILURE" "Python dependency install failed." "$RUN_METHOD"
+                   else
+                       record_result "FAILURE" "All Python stdio test methods failed." "$RUN_METHOD"
+                   fi
                 fi
-
-                echo "--> Installing Python dependencies using: $INSTALL_DESC"
-                # Run install in a subshell to handle potential || logic correctly with timeout
-                if ! timeout 480s bash -c "$INSTALL_CMD"; then
-                    record_result "FAILURE" "Python dependency install failed ($INSTALL_DESC)" "$RUN_METHOD"
-                    deactivate &>/dev/null || true # Attempt deactivate
-                    return
-                fi
-                echo "--> Python dependencies installed."
-
-                # Try common execution methods (stdio)
-                PYTHON_EXEC="python" # Could also be python3
-                SERVER_CMD=""
-                TEST_PASSED=false
-
-                declare -a python_files=("main.py" "app.py" "server.py")
-                for py_file in "${python_files[@]}"; do
-                    if [ -f "$py_file" ]; then
-                        echo "--> Trying '$PYTHON_EXEC $py_file'..."
-                        SERVER_CMD="$PYTHON_EXEC $py_file"
-                        if run_inspector_test "$SERVER_CMD" "$RUN_METHOD ($py_file)" "stdio"; then TEST_PASSED=true; break; fi
-                    fi
-                done
-
-                # Try running as module if no file worked
-                if ! $TEST_PASSED; then
-                    # Infer module name from directory name (replace hyphens with underscores)
-                    PY_MODULE_NAME=$(basename "$PWD" | sed 's/-/_/g')
-                    if [ -d "$PY_MODULE_NAME" ] || [ -f "${PY_MODULE_NAME}.py" ]; then
-                        echo "--> Trying '$PYTHON_EXEC -m $PY_MODULE_NAME'..."
-                        SERVER_CMD="$PYTHON_EXEC -m $PY_MODULE_NAME"
-                        if run_inspector_test "$SERVER_CMD" "$RUN_METHOD (-m module)" "stdio"; then TEST_PASSED=true; fi
-                    fi
-                fi
-
-                deactivate &>/dev/null || true # Deactivate venv
-                echo "--> Python venv deactivated."
-
-                if $TEST_PASSED; then return; fi # Exit if any test passed
-
-                # If all Python tests failed
-                record_result "FAILURE" "All Python stdio test methods failed." "$RUN_METHOD"
-                return
+                # Deactivation happens automatically when subshell exits
+                return # Exit function
             fi
 
 
@@ -686,12 +726,12 @@ jobs:
 
                 if ! timeout 300s go build -o "$BINARY_NAME" .; then
                     record_result "FAILURE" "go build failed" "$RUN_METHOD"
-                    return
+                    return # Exit on failure
                 fi
 
                 if [ ! -f "$BINARY_NAME" ]; then
                      record_result "FAILURE" "go build command succeeded but produced no binary named '$BINARY_NAME'" "$RUN_METHOD"
-                     return
+                     return # Exit on failure
                 fi
                 chmod +x "$BINARY_NAME"
                 echo "--> Go build successful: $BINARY_NAME"
@@ -706,14 +746,20 @@ jobs:
                 SERVER_CMD="$BINARY_NAME"
                 if run_inspector_test "$SERVER_CMD" "$RUN_METHOD (no args)" "stdio"; then return; fi
 
-                # If both Go tests failed
-                record_result "FAILURE" "All Go stdio test methods failed." "$RUN_METHOD"
-                return
+                # If we reach here, both Go methods failed. Failure recorded by last run_inspector_test call.
+                # Check if a failure was already recorded by checking the RESULT_FILE content
+                if ! jq -e '.status == "FAILURE"' "$RESULT_FILE" > /dev/null 2>&1; then
+                   record_result "FAILURE" "No Go stdio test methods were successful." "$RUN_METHOD"
+                fi
+                return # Exit function
             fi
 
 
             # Fallback: No recognizable method found or tested successfully
-            record_result "SKIPPED" "No supported build/run method (Dockerfile, package.json, pyproject.toml/requirements.txt, go.mod) found or tested successfully." "None"
+            # Only record this if no other result (SUCCESS/FAILURE/SKIPPED due to error) was recorded
+            if [ ! -f "$RESULT_FILE" ]; then
+               record_result "SKIPPED" "No supported build/run method (Dockerfile, Node, Python, Go) found or tested successfully." "None"
+            fi
 
             # Trap will handle cleanup and cd back
           } # === End of test_server function ===
@@ -756,7 +802,7 @@ jobs:
               # The function now handles its own cleanup and cd back via trap
               test_server "$repo_from_file" "$CURRENT_INDEX" "$TOTAL_SERVERS"
               # Brief pause between tests? Optional.
-              # sleep 2
+              # sleep 1
             done
             echo "--- Sequential testing complete ---"
           fi
@@ -807,16 +853,22 @@ jobs:
             exit 0
           fi
 
+          # Combine all JSON results into a single flat array using jq
+
+          # -s slurps all files into one array, flatten merges sub-arrays (if any), map(select(. != null)) removes null entries
+
           if ! find "$RESULTS_DIR" -name '*.json' -print0 | xargs -0 jq -s 'flatten | map(select(. != null))' > "$JSON_SUMMARY_FILE"; then
              echo "::error::Failed to combine JSON results using jq."
              SUMMARY_CONTENT="### Test Summary\n\nError combining test results."
              echo -e "$SUMMARY_CONTENT" > $SUMMARY_FILE
              echo -e "$SUMMARY_CONTENT" >> $GITHUB_STEP_SUMMARY
              echo "[]" > $JSON_SUMMARY_FILE
-             echo "failure_count=1" >> $GITHUB_OUTPUT
+             echo "failure_count=1" >> $GITHUB_OUTPUT # Indicate failure
              echo "summary_status=Error" >> $GITHUB_OUTPUT
-             exit 1
+             exit 1 # Fail the step
           fi
+
+          # Check if combined file is empty or just '[]' after potential errors/nulls
 
           if [ ! -s "$JSON_SUMMARY_FILE" ] || [ "$(jq 'length' "$JSON_SUMMARY_FILE")" -eq 0 ]; then
              echo "Combined results file is empty or contains no valid JSON objects."
@@ -838,13 +890,17 @@ jobs:
 
           SKIPPED_COUNT=$(jq '[.[] | select(.status=="SKIPPED")] | length' "$JSON_SUMMARY_FILE")
 
-          TOTAL_COUNT=$(jq 'length' "$JSON_SUMMARY_FILE")
+          TOTAL_COUNT=$(jq 'length' "$JSON_SUMMARY_FILE") # Total valid results processed
 
           echo "Summary Counts: Total=$TOTAL_COUNT, Success=$SUCCESS_COUNT, Failure=$FAILURE_COUNT, Skipped=$SKIPPED_COUNT"
 
-          echo "failure_count=$FAILURE_COUNT" >> $GITHUB_OUTPUT
+          echo "failure_count=$FAILURE_COUNT" >> $GITHUB_OUTPUT # Output failure count for workflow status check
 
-          OVERALL_STATUS="Success"; [[ "$FAILURE_COUNT" -gt 0 ]] && OVERALL_STATUS="Failure"
+          # Determine overall status for summary
+
+          OVERALL_STATUS="Success"
+
+          if [[ "$FAILURE_COUNT" -gt 0 ]]; then OVERALL_STATUS="Failure"; fi
 
           echo "summary_status=$OVERALL_STATUS" >> $GITHUB_OUTPUT
 
@@ -853,7 +909,9 @@ jobs:
 
           echo "# Test Summary (Full Report)" > $SUMMARY_FILE
 
-          echo "\n**Overall Status: $OVERALL_STATUS**" >> $SUMMARY_FILE
+          echo "" >> $SUMMARY_FILE # Add a newline
+
+          echo "**Overall Status: $OVERALL_STATUS**" >> $SUMMARY_FILE
 
           printf -- "- **Total Results Processed:** %s\n" "$TOTAL_COUNT" >> $SUMMARY_FILE
 
@@ -864,30 +922,40 @@ jobs:
           printf -- "- ⚠️ **Skipped:** %s\n" "$SKIPPED_COUNT" >> $SUMMARY_FILE
 
 
-          echo "\n## Failures ($FAILURE_COUNT)" >> $SUMMARY_FILE
+          # List Failures (if any)
+
+          echo "" >> $SUMMARY_FILE # Add a newline
+
+          echo "## Failures ($FAILURE_COUNT)" >> $SUMMARY_FILE
 
           if [ "$FAILURE_COUNT" -gt 0 ]; then
              echo "| Repository | Method | Reason | Duration |" >> $SUMMARY_FILE
              echo "|------------|--------|--------|----------|" >> $SUMMARY_FILE
-             # Add gsub to handle newlines in reasons for Markdown table
+             # Add gsub to handle newlines and pipes in reasons for Markdown table
              jq -r '.[] | select(.status=="FAILURE") | "| `\(.repo)` | \(.method // "N/A") | \(.reason // "N/A" | gsub("\\|"; "\\\\|") | gsub("\r?\n"; "<br>")) | \(.duration // "N/A")s |"' "$JSON_SUMMARY_FILE" >> $SUMMARY_FILE
           else
             echo "_None_" >> $SUMMARY_FILE
           fi
 
 
-          echo "\n## Skipped ($SKIPPED_COUNT)" >> $SUMMARY_FILE
+          # List Skipped (if any)
+
+          echo "" >> $SUMMARY_FILE # Add a newline
+
+          echo "## Skipped ($SKIPPED_COUNT)" >> $SUMMARY_FILE
 
           if [ "$SKIPPED_COUNT" -gt 0 ]; then
              echo "| Repository | Method | Reason | Duration |" >> $SUMMARY_FILE
              echo "|------------|--------|--------|----------|" >> $SUMMARY_FILE
-             # Add gsub to handle newlines in reasons for Markdown table
+             # Add gsub to handle newlines and pipes in reasons for Markdown table
              jq -r '.[] | select(.status=="SKIPPED") | "| `\(.repo)` | \(.method // "N/A") | \(.reason // "N/A" | gsub("\\|"; "\\\\|") | gsub("\r?\n"; "<br>")) | \(.duration // "N/A")s |"' "$JSON_SUMMARY_FILE" >> $SUMMARY_FILE
           else
             echo "_None_" >> $SUMMARY_FILE
           fi
 
-          echo "\nFull report generated: $SUMMARY_FILE"
+          echo "" >> $SUMMARY_FILE # Add a final newline
+
+          echo "Full report generated: $SUMMARY_FILE"
 
           echo "Full JSON summary: $JSON_SUMMARY_FILE"
 
@@ -925,12 +993,14 @@ jobs:
           if-no-files-found: ignore
       - name: Check for Failures in Summary
         if: always()
+        shell: bash -eo pipefail {0}
         run: >
           # Check the failure count output from the summary step
 
           FAILURE_COUNT="${{ steps.summary.outputs.failure_count }}"
 
           echo "Checking summary failure count: $FAILURE_COUNT"
+
 
           if [[ "$FAILURE_COUNT" -gt 0 ]]; then
             echo "::error::Detected $FAILURE_COUNT test failure(s) in the summary. Failing workflow."
