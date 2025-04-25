@@ -1,4 +1,3 @@
----
 name: MCP Server Awesome List Tests (Enhanced)
 on:
   workflow_dispatch:
